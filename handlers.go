@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 )
 
 // LoginHandler redirects the browser to the Forta OAuth2 authorization
@@ -16,6 +17,23 @@ import (
 //
 //	mux.HandleFunc("/forta/login", forta.LoginHandler)
 func (c *Client) LoginHandler(w http.ResponseWriter, r *http.Request) {
+	// First-party appleby.cloud services share the Forta session cookie and do
+	// not need the full OAuth2 code-exchange flow. Redirect directly to the
+	// Forta login page with a redirect_uri pointing back to this application.
+	if c.cfg.CookieDomain == ".appleby.cloud" {
+		redirectBack := c.cfg.postLoginRedirect()
+		if !strings.HasPrefix(redirectBack, "http") {
+			scheme := "https"
+			if r.TLS == nil && r.Header.Get("X-Forwarded-Proto") != "https" {
+				scheme = "http"
+			}
+			redirectBack = scheme + "://" + r.Host + redirectBack
+		}
+		loginURL := c.cfg.LoginDomain + "/?redirect_uri=" + url.QueryEscape(redirectBack)
+		http.Redirect(w, r, loginURL, http.StatusFound)
+		return
+	}
+
 	state, err := generateState()
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "failed to generate state token")
