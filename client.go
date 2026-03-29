@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -96,50 +95,34 @@ func (c *Client) exchangeCode(ctx context.Context, code string) (*AuthResponse, 
 	return &envelope.Data, nil
 }
 
-// getUserInfo calls GET /oauth/userinfo with the given Bearer token and returns
-// the user's OIDC profile. The returned User contains the fields available from
-// the standard userinfo response; database-only fields (e.g. Status) are empty.
+// getUserInfo calls GET /users/me with the given Bearer token and returns
+// the full authenticated user profile.
 func (c *Client) getUserInfo(ctx context.Context, accessToken string) (*User, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url("/oauth/userinfo"), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url("/users/me"), nil)
 	if err != nil {
-		return nil, fmt.Errorf("go-forta: userinfo: request: %w", err)
+		return nil, fmt.Errorf("go-forta: users/me: request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("go-forta: userinfo: %w", err)
+		return nil, fmt.Errorf("go-forta: users/me: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusUnauthorized {
-		return nil, fmt.Errorf("go-forta: userinfo: invalid or expired token")
+		return nil, fmt.Errorf("go-forta: users/me: invalid or expired token")
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("go-forta: userinfo: forta returned status %d", resp.StatusCode)
+		return nil, fmt.Errorf("go-forta: users/me: forta returned status %d", resp.StatusCode)
 	}
 
-	var info OAuthUserInfoResponse
-	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
-		return nil, fmt.Errorf("go-forta: userinfo: decode: %w", err)
+	var envelope fortaEnvelope[User]
+	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+		return nil, fmt.Errorf("go-forta: users/me: decode: %w", err)
 	}
 
-	id, err := strconv.ParseInt(info.Sub, 10, 64)
-	if err != nil {
-		return nil, fmt.Errorf("go-forta: userinfo: invalid sub %q: %w", info.Sub, err)
-	}
-
-	user := &User{
-		ID:              id,
-		Email:           info.Email,
-		EmailVerified:   info.EmailVerified,
-		Name:            info.Name,
-		ProfileImageURL: info.Picture,
-	}
-	if info.PreferredUsername != nil {
-		user.Metadata = &UserMetadata{Username: info.PreferredUsername}
-	}
-	return user, nil
+	return &envelope.Data, nil
 }
 
 // refreshTokens calls POST /auth/refresh with the given refresh token and

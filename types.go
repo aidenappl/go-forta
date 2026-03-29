@@ -3,7 +3,7 @@ package forta
 import "time"
 
 // User is the public profile of an authenticated Forta user as returned by
-// the /oauth/userinfo and /auth/exchange endpoints.
+// the /users/me and /auth/exchange endpoints.
 type User struct {
 	ID              int64         `json:"id"`
 	UUID            string        `json:"uuid"`
