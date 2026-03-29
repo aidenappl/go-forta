@@ -1,0 +1,8 @@
+{
+  "chat.tools.terminal.autoApprove": {
+    "/^cd /Users/aiden/Desktop/Personal/Repos/go-forta && python3 /dev/stdin <<PYEOF\nlines = \\[\n    \"package forta\",\n    \"\",\n    \"import \\(\",\n    '\\\\t\"context\"',\n    '\\\\t\"strconv\"',\n    \"\\)\",\n    \"\",\n    \"type contextKey string\",\n    \"\",\n    \"const \\(\",\n    '\\\\tctxFortaID   contextKey = \"forta-id\"',\n    '\\\\tctxFortaUser contextKey = \"forta-user\"',\n    \"\\)\",\n    \"\",\n    \"func contextWithFortaID\\(ctx context\\.Context, id int64\\) context\\.Context \\{\",\n    \"\\\\treturn context\\.WithValue\\(ctx, ctxFortaID, id\\)\",\n    \"\\}\",\n    \"\",\n    \"func contextWithUser\\(ctx context\\.Context, user \\*User\\) context\\.Context \\{\",\n    \"\\\\treturn context\\.WithValue\\(ctx, ctxFortaUser, user\\)\",\n    \"\\}\",\n    \"\",\n    \"func getFortaIDFromContext\\(ctx context\\.Context\\) \\(int64, bool\\) \\{\",\n    \"\\\\tid, ok := ctx\\.Value\\(ctxFortaID\\)\\.\\(int64\\)\",\n    \"\\\\treturn id, ok\",\n    \"\\}\",\n    \"\",\n    \"func getUserFromContext\\(ctx context\\.Context\\) \\(\\*User, bool\\) \\{\",\n    \"\\\\tu, ok := ctx\\.Value\\(ctxFortaUser\\)\\.\\(\\*User\\)\",\n    \"\\\\treturn u, ok\",\n    \"\\}\",\n    \"\",\n    \"func userIDFromSub\\(sub string\\) \\(int64, error\\) \\{\",\n    \"\\\\treturn strconv\\.ParseInt\\(sub, 10, 64\\)\",\n    \"\\}\",\n\\]\nwith open\\(\"context\\.go\", \"w\"\\) as f:\n    f\\.write\\(\"\\\\n\"\\.join\\(lines\\) \\+ \"\\\\n\"\\)\nprint\\(\"ok\"\\)\nPYEOF$/": {
+      "approve": true,
+      "matchCommandLine": true
+    }
+  }
+}

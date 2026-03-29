@@ -1,3 +1,5 @@
-module github.com/aidenapple/go-forta
+module github.com/aidenappl/go-forta
 
-go 1.24.10
+go 1.22
+
+require github.com/golang-jwt/jwt/v5 v5.2.2

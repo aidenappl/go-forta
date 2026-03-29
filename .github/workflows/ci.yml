@@ -1,0 +1,140 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  GO_VERSION: "1.25"
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Check formatting
+        run: test -z "$(gofmt -l .)" || (gofmt -d . && exit 1)
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          install-mode: goinstall
+          args: --timeout=5m
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Verify module
+        run: |
+          go mod verify
+          go mod tidy
+          git diff --exit-code go.mod go.sum || (echo "::error::go.mod or go.sum is not tidy" && exit 1)
+
+      - name: Build and Test
+        run: |
+          go build ./...
+          go test -race -coverprofile=coverage.out -covermode=atomic -p 4 ./...
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.out
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  security:
+    name: Security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Run govulncheck
+        uses: golang/govulncheck-action@v1
+        with:
+          go-version-input: ${{ env.GO_VERSION }}
+          go-package: ./...
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [lint, test, security]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate tag format
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9]+)?$ ]]; then
+            echo "::error::Invalid tag format: $TAG. Expected: vX.Y.Z or vX.Y.Z-suffix"
+            exit 1
+          fi
+          echo "TAG=$TAG" >> $GITHUB_ENV
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          {
+            echo "changelog<<EOF"
+            if [ -n "$PREV_TAG" ]; then
+              echo "## What's Changed since ${PREV_TAG}"
+              echo ""
+              git log ${PREV_TAG}..HEAD --pretty=format:"- %s (%h)" --no-merges
+            else
+              echo "## Initial Release"
+              echo ""
+              git log --pretty=format:"- %s (%h)" --no-merges
+            fi
+            echo ""
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body: |
+            ${{ steps.changelog.outputs.changelog }}
+
+            ## Installation
+
+            ```bash
+            go get github.com/aidenappl/go-forta/v1@${{ env.TAG }}
+            ```
+          generate_release_notes: true
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
