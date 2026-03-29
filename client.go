@@ -95,31 +95,31 @@ func (c *Client) exchangeCode(ctx context.Context, code string) (*AuthResponse, 
 	return &envelope.Data, nil
 }
 
-// getUserInfo calls GET /users/me with the given Bearer token and returns
+// getUserInfo calls GET /auth/self with the given Bearer token and returns
 // the full authenticated user profile.
 func (c *Client) getUserInfo(ctx context.Context, accessToken string) (*User, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url("/users/me"), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url("/auth/self"), nil)
 	if err != nil {
-		return nil, fmt.Errorf("go-forta: users/me: request: %w", err)
+		return nil, fmt.Errorf("go-forta: auth/self: request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("go-forta: users/me: %w", err)
+		return nil, fmt.Errorf("go-forta: auth/self: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusUnauthorized {
-		return nil, fmt.Errorf("go-forta: users/me: invalid or expired token")
+		return nil, fmt.Errorf("go-forta: auth/self: invalid or expired token")
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("go-forta: users/me: forta returned status %d", resp.StatusCode)
+		return nil, fmt.Errorf("go-forta: auth/self: forta returned status %d", resp.StatusCode)
 	}
 
 	var envelope fortaEnvelope[User]
 	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
-		return nil, fmt.Errorf("go-forta: users/me: decode: %w", err)
+		return nil, fmt.Errorf("go-forta: auth/self: decode: %w", err)
 	}
 
 	return &envelope.Data, nil

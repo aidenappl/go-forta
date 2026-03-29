@@ -14,11 +14,11 @@ import (
 //
 // Validation strategy:
 //   - If Config.JWTSigningKey is set: tokens are validated locally via HMAC-SHA512.
-//   - Otherwise: tokens are validated remotely by calling /users/me on the
+//   - Otherwise: tokens are validated remotely by calling /auth/self on the
 //     Forta API. The full User profile is then available via GetUserFromContext.
 //
 // If Config.FetchUserOnProtect is true and local validation is used, the
-// middleware additionally calls /users/me so that the full User profile
+// middleware additionally calls /auth/self so that the full User profile
 // is placed in the context.
 //
 // Auto-refresh: if the access token is expired (and DisableAutoRefresh is false)
@@ -70,7 +70,7 @@ func (c *Client) Protected(next http.HandlerFunc) http.HandlerFunc {
 				}
 			}
 		} else {
-			// ── Remote validation via /users/me ──────────────────────────────
+			// ── Remote validation via /auth/self ─────────────────────────────
 			u, err := c.getUserInfo(r.Context(), tokenStr)
 			if err != nil {
 				if c.cfg.DisableAutoRefresh {

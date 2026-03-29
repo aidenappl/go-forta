@@ -131,13 +131,13 @@ func GetFortaIDFromContext(ctx context.Context) (int64, bool) {
 // GetUserFromContext returns the full Forta User profile injected by the
 // Protected middleware. The profile is only present when:
 //   - Config.FetchUserOnProtect is true, OR
-//   - Config.JWTSigningKey is empty (remote validation via /users/me)
+//   - Config.JWTSigningKey is empty (remote validation via /auth/self)
 func GetUserFromContext(ctx context.Context) (*User, bool) {
 	return getUserFromContext(ctx)
 }
 
 // FetchCurrentUser retrieves the full Forta user profile for the access token
-// present in r. It calls the /users/me endpoint and is safe to call from
+// present in r. It calls the /auth/self endpoint and is safe to call from
 // any handler (not just Protected ones).
 func FetchCurrentUser(r *http.Request) (*User, error) {
 	if defaultClient == nil {
