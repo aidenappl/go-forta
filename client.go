@@ -118,7 +118,7 @@ func (c *Client) getUserInfo(ctx context.Context, accessToken string) (*User, er
 		return nil, fmt.Errorf("go-forta: userinfo: forta returned status %d", resp.StatusCode)
 	}
 
-	var info userInfoResponse
+	var info OAuthUserInfoResponse
 	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
 		return nil, fmt.Errorf("go-forta: userinfo: decode: %w", err)
 	}

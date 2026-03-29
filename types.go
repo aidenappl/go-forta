@@ -51,15 +51,16 @@ type fortaEnvelope[T any] struct {
 	Data    T      `json:"data"`
 }
 
-// userInfoResponse is the OIDC userinfo payload returned by /oauth/userinfo.
-// The sub field contains the Forta user ID as a decimal string.
-type userInfoResponse struct {
+// OAuthUserInfoResponse is the OIDC userinfo payload returned by /oauth/userinfo.
+// The Sub field contains the Forta user ID as a decimal string.
+// This type is used by both go-forta (client parsing) and forta-api (server response body).
+type OAuthUserInfoResponse struct {
 	Sub               string  `json:"sub"`
-	Name              *string `json:"name"`
+	Name              *string `json:"name,omitempty"`
 	Email             string  `json:"email"`
 	EmailVerified     bool    `json:"email_verified"`
-	Picture           *string `json:"picture"`
-	PreferredUsername *string `json:"preferred_username"`
+	Picture           *string `json:"picture,omitempty"`
+	PreferredUsername *string `json:"preferred_username,omitempty"`
 }
 
 // exchangeCodeRequest matches the body expected by POST /auth/exchange.
