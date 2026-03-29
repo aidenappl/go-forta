@@ -23,11 +23,17 @@ func (c *Client) LoginHandler(w http.ResponseWriter, r *http.Request) {
 	if c.cfg.CookieDomain == ".appleby.cloud" {
 		redirectBack := c.cfg.postLoginRedirect()
 		if !strings.HasPrefix(redirectBack, "http") {
-			scheme := "https"
-			if r.TLS == nil && r.Header.Get("X-Forwarded-Proto") != "https" {
-				scheme = "http"
+			var origin string
+			if c.cfg.AppDomain != "" {
+				origin = strings.TrimRight(c.cfg.AppDomain, "/")
+			} else {
+				scheme := "https"
+				if r.TLS == nil && r.Header.Get("X-Forwarded-Proto") != "https" {
+					scheme = "http"
+				}
+				origin = scheme + "://" + r.Host
 			}
-			redirectBack = scheme + "://" + r.Host + redirectBack
+			redirectBack = origin + redirectBack
 		}
 		loginURL := c.cfg.LoginDomain + "/?redirect_uri=" + url.QueryEscape(redirectBack)
 		http.Redirect(w, r, loginURL, http.StatusFound)

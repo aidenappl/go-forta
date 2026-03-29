@@ -37,6 +37,13 @@ type Config struct {
 	// LogoutHandler completes. Defaults to "/".
 	PostLogoutRedirect string
 
+	// AppDomain is the base URL of the application using Forta
+	// (e.g. "https://myapp.appleby.cloud"). When set it is used as the origin
+	// for all redirect URIs constructed by the library, preventing open-redirect
+	// attacks that could otherwise be triggered via manipulated request Host
+	// headers. Highly recommended in production.
+	AppDomain string
+
 	// CookieDomain sets the Domain attribute on auth cookies. Use
 	// ".appleby.cloud" for shared first-party cookies so they are readable
 	// across all subdomains. Leave empty for site-specific cookies.
