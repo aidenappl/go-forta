@@ -48,7 +48,7 @@ func (c *Client) Ping() error {
 	if err != nil {
 		return fmt.Errorf("go-forta: ping: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("go-forta: ping: unexpected status %d", resp.StatusCode)
 	}
@@ -78,7 +78,7 @@ func (c *Client) exchangeCode(ctx context.Context, code string) (*AuthResponse, 
 	if err != nil {
 		return nil, fmt.Errorf("go-forta: exchange: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("go-forta: exchange: forta returned status %d", resp.StatusCode)
@@ -109,7 +109,7 @@ func (c *Client) getUserInfo(ctx context.Context, accessToken string) (*User, er
 	if err != nil {
 		return nil, fmt.Errorf("go-forta: userinfo: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusUnauthorized {
 		return nil, fmt.Errorf("go-forta: userinfo: invalid or expired token")
@@ -154,7 +154,7 @@ func (c *Client) refreshTokens(ctx context.Context, refreshToken string) (*AuthR
 	if err != nil {
 		return nil, fmt.Errorf("go-forta: refresh: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusUnauthorized {
 		return nil, fmt.Errorf("go-forta: refresh: invalid or expired refresh token")

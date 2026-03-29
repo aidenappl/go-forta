@@ -2,7 +2,6 @@ package forta
 
 import (
 	"context"
-	"strconv"
 )
 
 type contextKey string
@@ -28,8 +27,4 @@ func getFortaIDFromContext(ctx context.Context) (int64, bool) {
 func getUserFromContext(ctx context.Context) (*User, bool) {
 	u, ok := ctx.Value(ctxFortaUser).(*User)
 	return u, ok
-}
-
-func userIDFromSub(sub string) (int64, error) {
-	return strconv.ParseInt(sub, 10, 64)
 }
