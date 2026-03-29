@@ -23,7 +23,8 @@ import forta "github.com/aidenappl/go-forta"
 
 func main() {
     err := forta.Setup(forta.Config{
-        Domain:       "https://forta.appleby.cloud",
+        APIDomain:    "https://api.forta.appleby.cloud",
+        LoginDomain:  "https://forta.appleby.cloud",
         ClientID:     "my-client-id",
         ClientSecret: "my-client-secret",
         CallbackURL:  "https://myapp.example.com/forta/callback",

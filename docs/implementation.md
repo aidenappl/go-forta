@@ -45,7 +45,8 @@ import forta "github.com/aidenappl/go-forta"
 
 func main() {
     if err := forta.Setup(forta.Config{
-        Domain:       "https://forta.appleby.cloud",
+        APIDomain:    os.Getenv("FORTA_API_DOMAIN"),   // e.g. "https://api.forta.appleby.cloud"
+        LoginDomain:  os.Getenv("FORTA_LOGIN_DOMAIN"), // e.g. "https://forta.appleby.cloud"
         ClientID:     os.Getenv("FORTA_CLIENT_ID"),
         ClientSecret: os.Getenv("FORTA_CLIENT_SECRET"),
         CallbackURL:  "https://myapp.example.com/forta/callback",
@@ -70,8 +71,11 @@ func main() {
 forta.Config{
     // --- Required ---
 
-    // Base URL of the Forta authentication server.
-    Domain: "https://forta.appleby.cloud",
+    // Base URL of the Forta API server — used for token exchange, validation, and user info.
+    APIDomain: "https://api.forta.appleby.cloud",
+
+    // Base URL of the Forta login UI — used to build the OAuth2 authorization redirect.
+    LoginDomain: "https://forta.appleby.cloud",
 
     // OAuth2 client credentials issued when registering your platform.
     ClientID:     "...",
@@ -207,7 +211,8 @@ func handleResource(w http.ResponseWriter, r *http.Request) {
 
 ```go
 forta.Setup(forta.Config{
-    Domain:       "https://forta.appleby.cloud",
+    APIDomain:   "https://api.forta.appleby.cloud",
+    LoginDomain: "https://forta.appleby.cloud",
     ClientID:     "...",
     ClientSecret: "...",
     CallbackURL:  "...",

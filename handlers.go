@@ -26,7 +26,7 @@ func (c *Client) LoginHandler(w http.ResponseWriter, r *http.Request) {
 
 	loginURL := fmt.Sprintf(
 		"%s/oauth/authorize?response_type=code&client_id=%s&redirect_uri=%s&state=%s&scope=openid",
-		c.cfg.Domain,
+		c.cfg.LoginDomain,
 		url.QueryEscape(c.cfg.ClientID),
 		url.QueryEscape(c.cfg.CallbackURL),
 		url.QueryEscape(state),

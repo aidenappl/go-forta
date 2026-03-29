@@ -22,8 +22,9 @@ func newClient(cfg Config) (*Client, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
-	// Strip trailing slash so all URL construction is consistent.
-	cfg.Domain = strings.TrimRight(cfg.Domain, "/")
+	// Strip trailing slashes so all URL construction is consistent.
+	cfg.APIDomain = strings.TrimRight(cfg.APIDomain, "/")
+	cfg.LoginDomain = strings.TrimRight(cfg.LoginDomain, "/")
 	return &Client{
 		cfg: cfg,
 		httpClient: &http.Client{
@@ -32,9 +33,9 @@ func newClient(cfg Config) (*Client, error) {
 	}, nil
 }
 
-// url builds a full URL against the configured Forta domain.
+// url builds a full URL against the configured Forta API domain.
 func (c *Client) url(path string) string {
-	return c.cfg.Domain + path
+	return c.cfg.APIDomain + path
 }
 
 // Ping calls GET /healthcheck and returns an error if the Forta API is not

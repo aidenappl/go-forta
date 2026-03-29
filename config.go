@@ -5,9 +5,15 @@ import "errors"
 // Config holds all the settings needed to use Forta as an authentication
 // provider. Pass it to Setup once at application startup.
 type Config struct {
-	// Domain is the base URL of the Forta authentication server.
+	// APIDomain is the base URL of the Forta API server used for token exchange,
+	// token validation, and user info lookups.
+	// Required. Example: "https://api.forta.appleby.cloud"
+	APIDomain string
+
+	// LoginDomain is the base URL of the Forta login UI used to build the
+	// OAuth2 authorization redirect in LoginHandler.
 	// Required. Example: "https://forta.appleby.cloud"
-	Domain string
+	LoginDomain string
 
 	// ClientID is the OAuth2 client ID registered with Forta for this platform.
 	// Required.
@@ -62,8 +68,11 @@ type Config struct {
 }
 
 func (c Config) validate() error {
-	if c.Domain == "" {
-		return errors.New("go-forta: Config.Domain is required")
+	if c.APIDomain == "" {
+		return errors.New("go-forta: Config.APIDomain is required")
+	}
+	if c.LoginDomain == "" {
+		return errors.New("go-forta: Config.LoginDomain is required")
 	}
 	if c.ClientID == "" {
 		return errors.New("go-forta: Config.ClientID is required")
