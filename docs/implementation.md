@@ -17,7 +17,8 @@ This document covers everything a client service needs to integrate Forta as its
 9. [Cookie configuration](#cookie-configuration)
 10. [Using multi-service instances](#using-multi-service-instances)
 11. [Fetching the user profile on demand](#fetching-the-user-profile-on-demand)
-12. [Error responses](#error-responses)
+12. [Optional Forta authentication](#optional-forta-authentication)
+13. [Error responses](#error-responses)
 
 ---
 
@@ -61,7 +62,7 @@ func main() {
 }
 ```
 
-`Setup` validates that `Domain`, `ClientID`, and `ClientSecret` are non-empty. It returns an error without panicking so you can handle it as part of your normal startup sequence.
+`Setup` validates that `APIDomain`, `LoginDomain`, `ClientID`, and `ClientSecret` are non-empty. It returns an error without panicking so you can handle it as part of your normal startup sequence.
 
 ---
 
@@ -93,6 +94,11 @@ forta.Config{
     // Where to redirect the user after LogoutHandler completes. Default: "/"
     PostLogoutRedirect: "/",
 
+    // Base URL of the application using go-forta (e.g. "https://myapp.appleby.cloud").
+    // When set, it is used as the origin for all redirect URIs constructed by the library,
+    // preventing open-redirect attacks via manipulated Host headers. Recommended in production.
+    AppDomain: "https://myapp.appleby.cloud",
+
     // Domain attribute for auth cookies.
     // Use ".appleby.cloud" on first-party services to share the session across subdomains.
     // Leave empty for site-scoped cookies (default behaviour).
@@ -103,10 +109,10 @@ forta.Config{
 
     // HMAC-SHA512 key shared with forta-api.
     // When set, tokens are validated in-process with no network call.
-    // When empty (default), each Protected request calls /oauth/userinfo.
+    // When empty (default), each Protected request calls /auth/self.
     JWTSigningKey: os.Getenv("FORTA_JWT_SIGNING_KEY"),
 
-    // When JWTSigningKey is set, also call /oauth/userinfo to populate
+    // When JWTSigningKey is set, also call /auth/self to populate
     // the full User in context (at the cost of a network call per request).
     FetchUserOnProtect: false,
 
@@ -187,7 +193,7 @@ func handleResource(w http.ResponseWriter, r *http.Request) {
     }
 
     // Full User profile — only available when:
-    //   - JWTSigningKey is empty (remote /oauth/userinfo validation), OR
+    //   - JWTSigningKey is empty (remote /auth/self validation), OR
     //   - FetchUserOnProtect: true
     user, hasUser := forta.GetUserFromContext(r.Context())
     if hasUser {
@@ -216,11 +222,11 @@ forta.Setup(forta.Config{
     ClientID:     "...",
     ClientSecret: "...",
     CallbackURL:  "...",
-    // JWTSigningKey omitted — validates via /oauth/userinfo
+    // JWTSigningKey omitted — validates via /auth/self
 })
 ```
 
-- Every protected request makes one HTTP call to `GET {Domain}/oauth/userinfo`.
+- Every protected request makes one HTTP call to `GET {APIDomain}/auth/self`.
 - The full `forta.User` profile is always available in context via `GetUserFromContext`.
 - No shared secret needed — simplest configuration.
 
@@ -301,7 +307,44 @@ func handlePublicPage(w http.ResponseWriter, r *http.Request) {
 }
 ```
 
-`FetchCurrentUser` reads the token from the same sources as `Protected` (Bearer header, then cookie) and calls `/oauth/userinfo`. It does **not** set any response cookies or perform auto-refresh.
+`FetchCurrentUser` reads the token from the same sources as `Protected` (Bearer header, then cookie) and calls `/auth/self`. It does **not** set any response cookies or perform auto-refresh.
+
+---
+
+## Optional Forta authentication
+
+Some routes need to accept **either** a Forta token **or** a different credential (e.g. an API key or a service token from another provider). For these routes, skip `forta.Protected` and call `forta.FetchCurrentUser` yourself — it attempts Forta validation without ever rejecting the request:
+
+```go
+func handleResource(w http.ResponseWriter, r *http.Request) {
+    // Attempt Forta authentication. Returns (nil, err) if no Forta token
+    // is present, the token is invalid, or the token is expired.
+    user, err := forta.FetchCurrentUser(r)
+    if err == nil {
+        // Request is authenticated as a Forta user.
+        fmt.Fprintf(w, "Hello, %s (Forta user %d)", user.Email, user.ID)
+        return
+    }
+
+    // Fall back to your own credential validation.
+    apiKey := r.Header.Get("X-API-Key")
+    if !isValidAPIKey(apiKey) {
+        http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+        return
+    }
+
+    // Non-Forta authenticated request.
+    fmt.Fprintf(w, "Hello, API service")
+}
+```
+
+`FetchCurrentUser` returns the full `*forta.User` on success, so all profile fields (`ID`, `Email`, `Name`, etc.) are immediately available — no separate context lookup required.
+
+Key points:
+
+- If neither an `Authorization: Bearer` header nor a `forta-access-token` cookie is present, `FetchCurrentUser` returns an error immediately with no network call.
+- It does **not** perform auto-refresh or write any cookies.
+- `GetFortaIDFromContext` and `GetUserFromContext` are **not** populated on optional-auth routes — use the `*forta.User` returned directly from `FetchCurrentUser` instead.
 
 ---
 
