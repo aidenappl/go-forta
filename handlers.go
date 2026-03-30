@@ -106,7 +106,13 @@ func (c *Client) CallbackHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	c.setAuthCookies(w, authResp.Authorization)
-	http.Redirect(w, r, c.cfg.postLoginRedirect(), http.StatusFound)
+
+	redirect := c.cfg.postLoginRedirect()
+	if c.cfg.AppDomain != "" && !strings.HasPrefix(redirect, "http") {
+		redirect = strings.TrimRight(c.cfg.AppDomain, "/") + redirect
+	}
+
+	http.Redirect(w, r, redirect, http.StatusFound)
 }
 
 // LogoutHandler clears all Forta auth cookies from the client and redirects
@@ -117,7 +123,13 @@ func (c *Client) CallbackHandler(w http.ResponseWriter, r *http.Request) {
 //	mux.HandleFunc("/forta/logout", forta.LogoutHandler)
 func (c *Client) LogoutHandler(w http.ResponseWriter, r *http.Request) {
 	c.clearAuthCookies(w)
-	http.Redirect(w, r, c.cfg.postLogoutRedirect(), http.StatusFound)
+
+	redirect := c.cfg.postLogoutRedirect()
+	if c.cfg.AppDomain != "" && !strings.HasPrefix(redirect, "http") {
+		redirect = strings.TrimRight(c.cfg.AppDomain, "/") + redirect
+	}
+
+	http.Redirect(w, r, redirect, http.StatusFound)
 }
 
 // generateState returns a 32-byte cryptographically random hex string for use
