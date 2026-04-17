@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -34,6 +35,7 @@ func newClient(cfg Config) (*Client, error) {
 	}
 	if cfg.EnforceGrants {
 		c.grants = newGrantCache(2 * time.Minute)
+		log.Printf("go-forta: grant enforcement enabled (client_id=%s, api=%s)", cfg.ClientID, cfg.APIDomain)
 	}
 	return c, nil
 }
@@ -184,6 +186,7 @@ func (c *Client) checkGrant(ctx context.Context, accessToken string) (bool, erro
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusForbidden {
+		log.Printf("go-forta: grant denied for client_id=%s", c.cfg.ClientID)
 		return false, nil
 	}
 	if resp.StatusCode == http.StatusOK {

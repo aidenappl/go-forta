@@ -107,8 +107,9 @@ func (c *Client) Protected(next http.HandlerFunc) http.HandlerFunc {
 				var grantErr error
 				granted, grantErr = c.checkGrant(r.Context(), tokenStr)
 				if grantErr != nil {
-					log.Printf("go-forta: grant check failed: %v (allowing request)", grantErr)
-					granted = true // fail-open on transient errors
+					log.Printf("go-forta: grant check failed: %v (denying request)", grantErr)
+					writeGrantDenied(w)
+					return
 				}
 				c.grants.set(userID, granted)
 			}
