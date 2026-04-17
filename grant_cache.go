@@ -43,4 +43,3 @@ func (gc *grantCache) set(userID int64, granted bool) {
 		checkedAt: time.Now(),
 	})
 }
-
