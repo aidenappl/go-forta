@@ -100,6 +100,24 @@ func (c *Client) Protected(next http.HandlerFunc) http.HandlerFunc {
 			}
 		}
 
+		// ── Grant enforcement (opt-in) ──────────────────────────────────
+		if c.cfg.EnforceGrants && c.grants != nil {
+			granted, found := c.grants.get(userID)
+			if !found {
+				var grantErr error
+				granted, grantErr = c.checkGrant(r.Context(), tokenStr)
+				if grantErr != nil {
+					log.Printf("go-forta: grant check failed: %v (allowing request)", grantErr)
+					granted = true // fail-open on transient errors
+				}
+				c.grants.set(userID, granted)
+			}
+			if !granted {
+				writeGrantDenied(w)
+				return
+			}
+		}
+
 		ctx := contextWithFortaID(r.Context(), userID)
 		if user != nil {
 			ctx = contextWithUser(ctx, user)

@@ -72,6 +72,13 @@ type Config struct {
 	// refreshing an expired access token using the refresh token cookie.
 	// Auto-refresh is enabled by default.
 	DisableAutoRefresh bool
+
+	// EnforceGrants enables grant checking on every authenticated request.
+	// When true, the Protected middleware verifies the user holds an active
+	// grant for this platform (identified by ClientID) via a cached call to
+	// the Forta API. The cache TTL is 2 minutes; revoked grants take effect
+	// within that window. Default: false (existing behavior).
+	EnforceGrants bool
 }
 
 func (c Config) validate() error {

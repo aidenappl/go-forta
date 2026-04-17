@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -14,6 +15,7 @@ import (
 type Client struct {
 	cfg        Config
 	httpClient *http.Client
+	grants     *grantCache // nil when EnforceGrants is false
 }
 
 // newClient validates cfg and returns a ready-to-use Client.
@@ -24,12 +26,16 @@ func newClient(cfg Config) (*Client, error) {
 	// Strip trailing slashes so all URL construction is consistent.
 	cfg.APIDomain = strings.TrimRight(cfg.APIDomain, "/")
 	cfg.LoginDomain = strings.TrimRight(cfg.LoginDomain, "/")
-	return &Client{
+	c := &Client{
 		cfg: cfg,
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
-	}, nil
+	}
+	if cfg.EnforceGrants {
+		c.grants = newGrantCache(2 * time.Minute)
+	}
+	return c, nil
 }
 
 // url builds a full URL against the configured Forta API domain.
@@ -133,6 +139,7 @@ func (c *Client) refreshTokens(ctx context.Context, refreshToken string) (*AuthR
 		return nil, fmt.Errorf("go-forta: refresh: request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+refreshToken)
+	req.Header.Set("X-Forta-Client-ID", c.cfg.ClientID)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -156,4 +163,32 @@ func (c *Client) refreshTokens(ctx context.Context, refreshToken string) (*AuthR
 	}
 
 	return &envelope.Data, nil
+}
+
+// checkGrant calls GET /internal/grants/check?client_id=<ClientID> to verify
+// the user holds an active grant for this platform. Returns true if the grant
+// is active, false if revoked/missing. On transient errors the method returns
+// true (fail-open) along with the error.
+func (c *Client) checkGrant(ctx context.Context, accessToken string) (bool, error) {
+	endpoint := c.url("/internal/grants/check") + "?client_id=" + url.QueryEscape(c.cfg.ClientID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return true, fmt.Errorf("go-forta: grant check: request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return true, fmt.Errorf("go-forta: grant check: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode == http.StatusForbidden {
+		return false, nil
+	}
+	if resp.StatusCode == http.StatusOK {
+		return true, nil
+	}
+
+	return true, fmt.Errorf("go-forta: grant check: unexpected status %d", resp.StatusCode)
 }
