@@ -44,8 +44,3 @@ func (gc *grantCache) set(userID int64, granted bool) {
 	})
 }
 
-// evict removes the cached entry for the given user, forcing a fresh check
-// on the next request.
-func (gc *grantCache) evict(userID int64) {
-	gc.entries.Delete(userID)
-}
