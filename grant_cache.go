@@ -28,7 +28,11 @@ func (gc *grantCache) get(userID int64) (granted bool, found bool) {
 	if !ok {
 		return false, false
 	}
-	entry := val.(grantCacheEntry)
+	entry, ok := val.(grantCacheEntry)
+	if !ok {
+		gc.entries.Delete(userID)
+		return false, false
+	}
 	if time.Since(entry.checkedAt) > gc.ttl {
 		gc.entries.Delete(userID)
 		return false, false

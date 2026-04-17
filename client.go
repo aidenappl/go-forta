@@ -46,9 +46,15 @@ func (c *Client) url(path string) string {
 }
 
 // Ping calls GET /healthcheck and returns an error if the Forta API is not
-// reachable or does not return 2xx.
+// reachable or does not return 2xx. It uses context.Background(); use
+// PingContext to supply a custom context.
 func (c *Client) Ping() error {
-	req, err := http.NewRequest(http.MethodGet, c.url("/healthcheck"), nil)
+	return c.PingContext(context.Background())
+}
+
+// PingContext is like Ping but accepts a context for cancellation and timeouts.
+func (c *Client) PingContext(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url("/healthcheck"), nil)
 	if err != nil {
 		return fmt.Errorf("go-forta: ping: %w", err)
 	}
@@ -170,18 +176,18 @@ func (c *Client) refreshTokens(ctx context.Context, refreshToken string) (*AuthR
 // checkGrant calls GET /internal/grants/check?client_id=<ClientID> to verify
 // the user holds an active grant for this platform. Returns true if the grant
 // is active, false if revoked/missing. On transient errors the method returns
-// true (fail-open) along with the error.
+// false (fail-closed) along with the error.
 func (c *Client) checkGrant(ctx context.Context, accessToken string) (bool, error) {
 	endpoint := c.url("/internal/grants/check") + "?client_id=" + url.QueryEscape(c.cfg.ClientID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return true, fmt.Errorf("go-forta: grant check: request: %w", err)
+		return false, fmt.Errorf("go-forta: grant check: request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return true, fmt.Errorf("go-forta: grant check: %w", err)
+		return false, fmt.Errorf("go-forta: grant check: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -193,5 +199,5 @@ func (c *Client) checkGrant(ctx context.Context, accessToken string) (bool, erro
 		return true, nil
 	}
 
-	return true, fmt.Errorf("go-forta: grant check: unexpected status %d", resp.StatusCode)
+	return false, fmt.Errorf("go-forta: grant check: unexpected status %d", resp.StatusCode)
 }

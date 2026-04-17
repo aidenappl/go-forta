@@ -1,6 +1,9 @@
 package forta
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 // Config holds all the settings needed to use Forta as an authentication
 // provider. Pass it to Setup once at application startup.
@@ -79,6 +82,12 @@ type Config struct {
 	// the Forta API. The cache TTL is 2 minutes; revoked grants take effect
 	// within that window. Default: false (existing behavior).
 	EnforceGrants bool
+}
+
+// String returns a human-readable representation of the config with secrets
+// redacted so it is safe to include in logs.
+func (c Config) String() string {
+	return fmt.Sprintf("Config{APIDomain:%s, ClientID:%s, LoginDomain:%s}", c.APIDomain, c.ClientID, c.LoginDomain)
 }
 
 func (c Config) validate() error {

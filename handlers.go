@@ -2,6 +2,7 @@ package forta
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
 	"net/http"
@@ -21,6 +22,12 @@ func (c *Client) LoginHandler(w http.ResponseWriter, r *http.Request) {
 	// not need the full OAuth2 code-exchange flow. Redirect directly to the
 	// Forta login page with a redirect_uri pointing back to this application.
 	if c.cfg.CookieDomain == ".appleby.cloud" {
+		// Validate Host header when constructing origin from request.
+		if c.cfg.CookieDomain != "" && !strings.HasSuffix(r.Host, c.cfg.CookieDomain) {
+			writeJSONError(w, http.StatusBadRequest, "invalid host")
+			return
+		}
+
 		redirectBack := c.cfg.postLoginRedirect()
 		if !strings.HasPrefix(redirectBack, "http") {
 			var origin string
@@ -35,6 +42,7 @@ func (c *Client) LoginHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			redirectBack = origin + redirectBack
 		}
+		redirectBack = c.safeRedirect(redirectBack)
 		loginURL := c.cfg.LoginDomain + "/?redirect_uri=" + url.QueryEscape(redirectBack)
 		http.Redirect(w, r, loginURL, http.StatusFound)
 		return
@@ -81,8 +89,8 @@ func (c *Client) CallbackHandler(w http.ResponseWriter, r *http.Request) {
 	code := r.URL.Query().Get("code")
 	state := r.URL.Query().Get("state")
 
-	if code == "" {
-		writeJSONError(w, http.StatusBadRequest, "missing code parameter")
+	if code == "" || state == "" {
+		writeJSONError(w, http.StatusBadRequest, "missing code or state parameter")
 		return
 	}
 
@@ -92,7 +100,7 @@ func (c *Client) CallbackHandler(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "missing state cookie — possible CSRF or expired session")
 		return
 	}
-	if stateCookie.Value != state {
+	if subtle.ConstantTimeCompare([]byte(stateCookie.Value), []byte(state)) != 1 {
 		writeJSONError(w, http.StatusBadRequest, "state mismatch — possible CSRF attack")
 		return
 	}
@@ -107,10 +115,7 @@ func (c *Client) CallbackHandler(w http.ResponseWriter, r *http.Request) {
 
 	c.setAuthCookies(w, authResp.Authorization)
 
-	redirect := c.cfg.postLoginRedirect()
-	if c.cfg.AppDomain != "" && !strings.HasPrefix(redirect, "http") {
-		redirect = strings.TrimRight(c.cfg.AppDomain, "/") + redirect
-	}
+	redirect := c.safeRedirect(c.cfg.postLoginRedirect())
 
 	http.Redirect(w, r, redirect, http.StatusFound)
 }
@@ -124,12 +129,27 @@ func (c *Client) CallbackHandler(w http.ResponseWriter, r *http.Request) {
 func (c *Client) LogoutHandler(w http.ResponseWriter, r *http.Request) {
 	c.clearAuthCookies(w)
 
-	redirect := c.cfg.postLogoutRedirect()
-	if c.cfg.AppDomain != "" && !strings.HasPrefix(redirect, "http") {
-		redirect = strings.TrimRight(c.cfg.AppDomain, "/") + redirect
-	}
+	redirect := c.safeRedirect(c.cfg.postLogoutRedirect())
 
 	http.Redirect(w, r, redirect, http.StatusFound)
+}
+
+// safeRedirect validates a redirect URL against the configured AppDomain to
+// prevent open-redirect attacks. If the redirect is an absolute URL whose host
+// does not match AppDomain, "/" is returned instead.
+func (c *Client) safeRedirect(redirect string) string {
+	if c.cfg.AppDomain != "" && strings.HasPrefix(redirect, "http") {
+		parsed, err := url.Parse(redirect)
+		appParsed, _ := url.Parse(c.cfg.AppDomain)
+		if err != nil || parsed.Host != appParsed.Host {
+			return "/"
+		}
+		return redirect
+	}
+	if c.cfg.AppDomain != "" {
+		return strings.TrimRight(c.cfg.AppDomain, "/") + redirect
+	}
+	return redirect
 }
 
 // generateState returns a 32-byte cryptographically random hex string for use

@@ -42,13 +42,17 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"sync"
 )
 
 // ErrNotConfigured is returned by package-level functions when Setup has not
 // been called yet.
 var ErrNotConfigured = errors.New("go-forta: Setup has not been called")
 
-var defaultClient *Client
+var (
+	defaultClientMu sync.RWMutex
+	defaultClient   *Client
+)
 
 // Setup initialises the global Forta client with the provided configuration.
 // It must be called once before any other function in this package.
@@ -57,18 +61,37 @@ func Setup(cfg Config) error {
 	if err != nil {
 		return err
 	}
+	defaultClientMu.Lock()
 	defaultClient = c
+	defaultClientMu.Unlock()
 	return nil
+}
+
+// getDefaultClient returns the global client safely under a read lock.
+func getDefaultClient() *Client {
+	defaultClientMu.RLock()
+	defer defaultClientMu.RUnlock()
+	return defaultClient
 }
 
 // Ping tests connectivity to the configured Forta API by calling its
 // /healthcheck endpoint. Returns an error if the service is unreachable or
 // returns a non-2xx response.
 func Ping() error {
-	if defaultClient == nil {
+	c := getDefaultClient()
+	if c == nil {
 		return ErrNotConfigured
 	}
-	return defaultClient.Ping()
+	return c.Ping()
+}
+
+// PingContext is like Ping but accepts a context for cancellation and timeouts.
+func PingContext(ctx context.Context) error {
+	c := getDefaultClient()
+	if c == nil {
+		return ErrNotConfigured
+	}
+	return c.PingContext(ctx)
 }
 
 // Protected wraps the given http.HandlerFunc, requiring a valid Forta access
@@ -80,23 +103,25 @@ func Ping() error {
 // valid refresh token cookie is present, the tokens are refreshed transparently
 // and new cookies are written to the response.
 func Protected(next http.HandlerFunc) http.HandlerFunc {
-	if defaultClient == nil {
+	c := getDefaultClient()
+	if c == nil {
 		return func(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusInternalServerError, "forta: not configured")
 		}
 	}
-	return defaultClient.Protected(next)
+	return c.Protected(next)
 }
 
 // LoginHandler redirects the browser to the Forta OAuth2 authorization
 // endpoint. A CSRF state token is stored in an HttpOnly cookie and validated
 // on return via CallbackHandler.
 func LoginHandler(w http.ResponseWriter, r *http.Request) {
-	if defaultClient == nil {
+	c := getDefaultClient()
+	if c == nil {
 		writeJSONError(w, http.StatusInternalServerError, "forta: not configured")
 		return
 	}
-	defaultClient.LoginHandler(w, r)
+	c.LoginHandler(w, r)
 }
 
 // CallbackHandler handles the OAuth2 redirect callback from Forta.
@@ -104,21 +129,23 @@ func LoginHandler(w http.ResponseWriter, r *http.Request) {
 // pair, stores the tokens as HttpOnly cookies, and redirects to
 // Config.PostLoginRedirect (default "/").
 func CallbackHandler(w http.ResponseWriter, r *http.Request) {
-	if defaultClient == nil {
+	c := getDefaultClient()
+	if c == nil {
 		writeJSONError(w, http.StatusInternalServerError, "forta: not configured")
 		return
 	}
-	defaultClient.CallbackHandler(w, r)
+	c.CallbackHandler(w, r)
 }
 
 // LogoutHandler clears all Forta auth cookies and redirects to
 // Config.PostLogoutRedirect (default "/").
 func LogoutHandler(w http.ResponseWriter, r *http.Request) {
-	if defaultClient == nil {
+	c := getDefaultClient()
+	if c == nil {
 		writeJSONError(w, http.StatusInternalServerError, "forta: not configured")
 		return
 	}
-	defaultClient.LogoutHandler(w, r)
+	c.LogoutHandler(w, r)
 }
 
 // GetFortaIDFromContext returns the authenticated user's Forta ID injected by
@@ -140,12 +167,13 @@ func GetUserFromContext(ctx context.Context) (*User, bool) {
 // present in r. It calls the /auth/self endpoint and is safe to call from
 // any handler (not just Protected ones).
 func FetchCurrentUser(r *http.Request) (*User, error) {
-	if defaultClient == nil {
+	c := getDefaultClient()
+	if c == nil {
 		return nil, ErrNotConfigured
 	}
 	token := extractToken(r)
 	if token == "" {
 		return nil, errors.New("go-forta: no access token found in request")
 	}
-	return defaultClient.getUserInfo(r.Context(), token)
+	return c.getUserInfo(r.Context(), token)
 }
