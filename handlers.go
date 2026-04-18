@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -111,6 +112,22 @@ func (c *Client) CallbackHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeJSONError(w, http.StatusUnauthorized, "failed to exchange authorization code")
 		return
+	}
+
+	// Check grant before completing login — deny access if user has no active
+	// grant for this platform.
+	if c.cfg.EnforceGrants && c.grants != nil {
+		granted, grantErr := c.checkGrant(r.Context(), authResp.Authorization.AccessToken)
+		if grantErr != nil {
+			log.Printf("go-forta: grant check at login failed: %v", grantErr)
+			writeGrantDenied(w)
+			return
+		}
+		if !granted {
+			writeGrantDenied(w)
+			return
+		}
+		c.grants.set(authResp.User.ID, granted)
 	}
 
 	c.setAuthCookies(w, authResp.Authorization)

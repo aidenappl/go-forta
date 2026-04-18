@@ -57,6 +57,10 @@ func (c *Client) Protected(next http.HandlerFunc) http.HandlerFunc {
 				// Update tokenStr so FetchUserOnProtect below uses the new token.
 				tokenStr = newToken
 				id = refreshedID
+				// Invalidate cached grant so it is re-checked with the fresh token.
+				if c.grants != nil {
+					c.grants.invalidate(refreshedID)
+				}
 			}
 			userID = id
 
@@ -87,6 +91,10 @@ func (c *Client) Protected(next http.HandlerFunc) http.HandlerFunc {
 					return
 				}
 				userID = refreshedID
+				// Invalidate cached grant so it is re-checked with the fresh token.
+				if c.grants != nil {
+					c.grants.invalidate(refreshedID)
+				}
 				// Fetch the updated profile with the new token.
 				if newToken != "" {
 					if nu, uiErr := c.getUserInfo(r.Context(), newToken); uiErr == nil {

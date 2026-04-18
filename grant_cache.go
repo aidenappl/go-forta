@@ -40,6 +40,12 @@ func (gc *grantCache) get(userID int64) (granted bool, found bool) {
 	return entry.granted, true
 }
 
+// invalidate removes the cached grant entry for the given user, forcing a
+// fresh check on the next request.
+func (gc *grantCache) invalidate(userID int64) {
+	gc.entries.Delete(userID)
+}
+
 // set stores a grant check result for the given user.
 func (gc *grantCache) set(userID int64, granted bool) {
 	gc.entries.Store(userID, grantCacheEntry{
