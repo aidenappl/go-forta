@@ -3,6 +3,7 @@ package forta
 import (
 	"errors"
 	"fmt"
+	"time"
 )
 
 // Config holds all the settings needed to use Forta as an authentication
@@ -79,9 +80,13 @@ type Config struct {
 	// EnforceGrants enables grant checking on every authenticated request.
 	// When true, the Protected middleware verifies the user holds an active
 	// grant for this platform (identified by ClientID) via a cached call to
-	// the Forta API. The cache TTL is 2 minutes; revoked grants take effect
-	// within that window. Default: false (existing behavior).
+	// the Forta API. Revoked grants take effect once the cache entry expires.
+	// Default: false (existing behavior).
 	EnforceGrants bool
+
+	// GrantCacheTTL controls how long grant check results are cached in memory.
+	// Only relevant when EnforceGrants is true. Default: 30 seconds.
+	GrantCacheTTL time.Duration
 }
 
 // String returns a human-readable representation of the config with secrets

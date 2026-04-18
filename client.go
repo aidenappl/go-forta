@@ -34,8 +34,12 @@ func newClient(cfg Config) (*Client, error) {
 		},
 	}
 	if cfg.EnforceGrants {
-		c.grants = newGrantCache(2 * time.Minute)
-		log.Printf("go-forta: grant enforcement enabled (client_id=%s, api=%s)", cfg.ClientID, cfg.APIDomain)
+		ttl := cfg.GrantCacheTTL
+		if ttl <= 0 {
+			ttl = 30 * time.Second
+		}
+		c.grants = newGrantCache(ttl)
+		log.Printf("go-forta: grant enforcement enabled (client_id=%s, api=%s, cache_ttl=%s)", cfg.ClientID, cfg.APIDomain, ttl)
 	}
 	return c, nil
 }
