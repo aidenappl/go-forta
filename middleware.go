@@ -91,6 +91,7 @@ func (c *Client) Protected(next http.HandlerFunc) http.HandlerFunc {
 					return
 				}
 				userID = refreshedID
+				tokenStr = newToken
 				// Invalidate cached grant so it is re-checked with the fresh token.
 				if c.grants != nil {
 					c.grants.invalidate(refreshedID)
