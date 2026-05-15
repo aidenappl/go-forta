@@ -16,8 +16,15 @@ const (
 // FortaClaims is the JWT claims payload used by all Forta access tokens.
 // It mirrors the FortaClaims struct in forta-api so that tokens can be
 // validated locally when JWTSigningKey is configured.
+//
+// PlatformID is set when the token was issued via an OAuth2 platform exchange
+// (HandleOAuthToken / HandleExchangeCode). It binds the token to a specific
+// platform so revocation can be enforced on refresh without trusting a
+// caller-supplied header. Tokens minted by direct Forta login (Google/Apple/
+// local) leave PlatformID nil.
 type FortaClaims struct {
-	Type string `json:"typ"`
+	Type       string `json:"typ"`
+	PlatformID *int64 `json:"platform_id,omitempty"`
 	jwt.RegisteredClaims
 }
 
