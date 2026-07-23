@@ -17,6 +17,7 @@ type Client struct {
 	cfg        Config
 	httpClient *http.Client
 	grants     *grantCache // nil when EnforceGrants is false
+	apiTokens  *apiTokenCache
 }
 
 // newClient validates cfg and returns a ready-to-use Client.
@@ -27,11 +28,16 @@ func newClient(cfg Config) (*Client, error) {
 	// Strip trailing slashes so all URL construction is consistent.
 	cfg.APIDomain = strings.TrimRight(cfg.APIDomain, "/")
 	cfg.LoginDomain = strings.TrimRight(cfg.LoginDomain, "/")
+	apiTokenTTL := cfg.APITokenCacheTTL
+	if apiTokenTTL <= 0 {
+		apiTokenTTL = DefaultAPITokenCacheTTL
+	}
 	c := &Client{
 		cfg: cfg,
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
+		apiTokens: newAPITokenCache(apiTokenTTL),
 	}
 	if cfg.EnforceGrants {
 		ttl := cfg.GrantCacheTTL

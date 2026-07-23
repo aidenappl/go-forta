@@ -1,20 +1,24 @@
 package forta
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"strings"
 )
 
-// Protected wraps next, requiring a valid Forta access token. The token is
+// Protected wraps next, requiring a valid Forta credential. The token is
 // read from (in order of preference):
 //
-//  1. Authorization: Bearer <token> header (valid 3-part JWT only)
+//  1. Authorization: Bearer <token> header (a 3-part JWT, or an frt_ API token)
 //  2. forta-access-token cookie
 //
 // Validation strategy:
-//   - If Config.JWTSigningKey is set: tokens are validated locally via HMAC-SHA512.
-//   - Otherwise: tokens are validated remotely by calling /auth/self on the
+//   - Opaque API tokens (frt_…) are always validated remotely via /auth/self,
+//     since they carry no claims. Results are cached for APITokenCacheTTL,
+//     which also bounds how long a revoked token keeps working.
+//   - If Config.JWTSigningKey is set: JWTs are validated locally via HMAC-SHA512.
+//   - Otherwise: JWTs are validated remotely by calling /auth/self on the
 //     Forta API. The full User profile is then available via GetUserFromContext.
 //
 // If Config.FetchUserOnProtect is true and local validation is used, the
@@ -24,6 +28,7 @@ import (
 // Auto-refresh: if the access token is expired (and DisableAutoRefresh is false)
 // the middleware attempts to refresh using the forta-refresh-token cookie. On
 // success, new cookies are written to the response and the request proceeds.
+// API tokens are never refreshed — they are long-lived by design.
 func (c *Client) Protected(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		tokenStr := extractToken(r)
@@ -36,7 +41,16 @@ func (c *Client) Protected(next http.HandlerFunc) http.HandlerFunc {
 		var userID int64
 		var user *User
 
-		if c.cfg.JWTSigningKey != "" {
+		if IsAPIToken(tokenStr) {
+			// ── Opaque API token: always resolved remotely ───────────────────
+			u, err := c.resolveAPIToken(r.Context(), tokenStr)
+			if err != nil {
+				writeJSONError(w, http.StatusUnauthorized, "invalid or expired api token")
+				return
+			}
+			userID = u.ID
+			user = u
+		} else if c.cfg.JWTSigningKey != "" {
 			// ── Local JWT validation ─────────────────────────────────────────
 			id, err := validateAccessTokenLocal(tokenStr, c.cfg.JWTSigningKey)
 			if err != nil {
@@ -154,11 +168,40 @@ func (c *Client) tryRefresh(w http.ResponseWriter, r *http.Request) (int64, stri
 	return authResp.User.ID, authResp.Authorization.AccessToken, nil
 }
 
+// resolveAPIToken exchanges an opaque API token for its owning user via
+// /auth/self, memoizing the result so a token used on every request does not
+// produce a round-trip each time. A token that fails to resolve is evicted so
+// revocation takes effect at the end of the cache TTL rather than never.
+func (c *Client) resolveAPIToken(ctx context.Context, token string) (*User, error) {
+	if c.apiTokens != nil {
+		if user, ok := c.apiTokens.get(token); ok {
+			return user, nil
+		}
+	}
+
+	user, err := c.getUserInfo(ctx, token)
+	if err != nil {
+		if c.apiTokens != nil {
+			c.apiTokens.invalidate(token)
+		}
+		return nil, err
+	}
+
+	if c.apiTokens != nil {
+		c.apiTokens.set(token, user)
+	}
+	return user, nil
+}
+
 // extractToken returns the Bearer token from the Authorization header, falling
 // back to the forta-access-token cookie. Returns "" if neither is present.
 func extractToken(r *http.Request) string {
 	if authHeader := r.Header.Get("Authorization"); strings.HasPrefix(authHeader, "Bearer ") {
 		candidate := strings.TrimPrefix(authHeader, "Bearer ")
+		// Opaque API tokens are passed through as-is; they are not JWTs.
+		if IsAPIToken(candidate) {
+			return candidate
+		}
 		// A valid JWT has exactly 2 dots. Guard against "Bearer undefined" etc.
 		if strings.Count(candidate, ".") == 2 {
 			return candidate

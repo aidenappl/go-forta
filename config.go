@@ -87,6 +87,12 @@ type Config struct {
 	// GrantCacheTTL controls how long grant check results are cached in memory.
 	// Only relevant when EnforceGrants is true. Default: 30 seconds.
 	GrantCacheTTL time.Duration
+
+	// APITokenCacheTTL controls how long a resolved opaque API token (frt_…) is
+	// reused before being re-validated against Forta. This also bounds
+	// revocation latency: a token revoked in Forta keeps working for at most
+	// this long. Default: 60 seconds.
+	APITokenCacheTTL time.Duration
 }
 
 // String returns a human-readable representation of the config with secrets
