@@ -71,7 +71,7 @@ func handleMe(w http.ResponseWriter, r *http.Request) {
 
 ## API tokens
 
-Since **v1.2.0**, `Protected` also accepts long-lived opaque Forta API tokens — the `frt_`-prefixed credentials minted by `POST /admin/api-tokens`. These are what CLIs, CI jobs and MCP servers use in place of the 10-minute access JWT.
+Since **v1.3.0**, `Protected` also accepts long-lived opaque Forta API tokens — the `frt_`-prefixed credentials minted by `POST /admin/api-tokens`. These are what CLIs, CI jobs and MCP servers use in place of the 10-minute access JWT.
 
 They carry no claims, so they cannot be validated locally. `Protected` resolves them against `/auth/self` and caches the result:
 
@@ -84,7 +84,7 @@ forta.Setup(forta.Config{
 
 The TTL bounds revocation latency: a token revoked in Forta keeps working here for at most that long. Set it lower for tighter revocation at the cost of more round-trips. API tokens are never auto-refreshed — they are long-lived by design.
 
-No configuration is required to enable this; a service on v1.2.0+ accepts both credential forms automatically. `forta.IsAPIToken(s)` reports whether a given credential is one.
+No configuration is required to enable this; a service on v1.3.0+ accepts both credential forms automatically. `forta.IsAPIToken(s)` reports whether a given credential is one.
 
 ---
 
