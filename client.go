@@ -18,6 +18,11 @@ type Client struct {
 	httpClient *http.Client
 	grants     *grantCache // nil when EnforceGrants is false
 	apiTokens  *apiTokenCache
+	// jwks caches the issuer's RS256 public keys. Constructing it performs no
+	// I/O — the key set is fetched lazily the first time an RS256 token is
+	// actually presented, so an HS512-only deployment never touches the
+	// network for it.
+	jwks *jwksCache
 }
 
 // newClient validates cfg and returns a ready-to-use Client.
@@ -38,6 +43,7 @@ func newClient(cfg Config) (*Client, error) {
 			Timeout: 10 * time.Second,
 		},
 		apiTokens: newAPITokenCache(apiTokenTTL),
+		jwks:      newJWKSCache(cfg.jwksURL(), cfg.JWKSMinRefreshInterval, cfg.JWKSMaxAge),
 	}
 	if cfg.EnforceGrants {
 		ttl := cfg.GrantCacheTTL

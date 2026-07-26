@@ -46,7 +46,7 @@ import forta "github.com/aidenappl/go-forta"
 
 func main() {
     if err := forta.Setup(forta.Config{
-        APIDomain:    os.Getenv("FORTA_API_DOMAIN"),   // e.g. "https://api.forta.appleby.cloud"
+        APIDomain:    os.Getenv("FORTA_API_DOMAIN"),   // e.g. "https://auth.appleby.cloud"
         LoginDomain:  os.Getenv("FORTA_LOGIN_DOMAIN"), // e.g. "https://forta.appleby.cloud"
         ClientID:     os.Getenv("FORTA_CLIENT_ID"),
         ClientSecret: os.Getenv("FORTA_CLIENT_SECRET"),
@@ -73,7 +73,7 @@ forta.Config{
     // --- Required ---
 
     // Base URL of the Forta API server — used for token exchange, validation, and user info.
-    APIDomain: "https://api.forta.appleby.cloud",
+    APIDomain: "https://auth.appleby.cloud",
 
     // Base URL of the Forta login UI — used to build the OAuth2 authorization redirect.
     LoginDomain: "https://forta.appleby.cloud",
@@ -118,8 +118,102 @@ forta.Config{
 
     // Prevents automatic transparent token refresh on expiry. Default: false (refresh enabled).
     DisableAutoRefresh: false,
+
+    // --- RS256 / JWKS (v1.4.0+, all optional) ---
+
+    // Where the issuer's public JSON Web Key Set is fetched from.
+    // Default: "{APIDomain}/oauth/jwks" — correct for every real deployment.
+    JWKSURL: "",
+
+    // Minimum time between two JWKS fetches triggered by an unknown key id.
+    // Default: 5 minutes. This is a rate limit, not a cache TTL — see below.
+    JWKSMinRefreshInterval: 5 * time.Minute,
+
+    // How long a cached key set is served before it is re-fetched.
+    // Default: 1 hour, overridden by the response's Cache-Control max-age when
+    // present (clamped to 5m–24h). This bounds how long a REVOKED signing key
+    // keeps verifying tokens here. Independent of JWKSMinRefreshInterval.
+    JWKSMaxAge: time.Hour,
+
+    // Enables local validation with NO shared secret at all (RS256 only).
+    // Leave false until forta-api has flipped to RS256 and you have removed
+    // JWTSigningKey from the deployment. Not needed to accept RS256 tokens.
+    EnableJWKS: false,
+
+    // --- Issuer acceptance (v1.4.0+, optional) ---
+
+    // Overrides the accepted "iss" claim values. Empty (the default) accepts
+    // BOTH "forta:auth-service" (legacy, what tokens carry today) and
+    // "https://auth.appleby.cloud" (the OIDC discovery issuer, the target).
+    // A non-empty list is used exactly as given — no defaults are merged in.
+    AcceptedIssuers: nil,
 }
 ```
+
+---
+
+## Local validation: HS512 and RS256
+
+When `JWTSigningKey` is set (or `EnableJWKS` is true), `Protected` verifies the JWT in-process
+and dispatches on the token's `alg` header:
+
+| `alg` | Verified with | Network |
+| ----- | ------------- | ------- |
+| `HS512` | `JWTSigningKey`, the shared secret | none |
+| `RS256` | Issuer public key, by `kid`, from the JWKS | lazy fetch, then cached in memory |
+| anything else, including `none` | rejected | none |
+
+Nothing changes for an existing service. Forta issues HS512 tokens today, so the HS512 path
+runs and **the JWKS endpoint is never contacted**. The key set is fetched lazily the first time
+an RS256 token actually arrives — never at `Setup()`, so upgrading does not add a startup
+dependency on `forta-api`.
+
+**Key rotation.** A token carrying a `kid` that is not in the cache triggers one re-fetch of the
+key set, so a newly published signing key is discovered on first use. That re-fetch is
+rate-limited to once per `JWKSMinRefreshInterval` (default 5 minutes) across the whole key set,
+so an attacker cannot use forged `kid` values to drive unbounded traffic at Forta. The trade-off
+is that a rotated key can take up to that long to be picked up.
+
+**Do not lower `JWKSMinRefreshInterval` to near-zero in production** — that is exactly the DoS
+amplification the limit exists to prevent.
+
+**Key revocation.** Rotation and revocation are different problems, and only the first is solved
+by the unknown-`kid` re-fetch. **Previously, a `kid` that was already cached was never
+revalidated** — no TTL, no `Cache-Control` handling — so a signing key the issuer had withdrawn
+kept verifying tokens, with no further network request, for the life of the process. Emergency
+revocation had no propagation mechanism at all.
+
+Cached key sets now carry a max age (`JWKSMaxAge`, default **1 hour**, overridden by the JWKS
+response's `Cache-Control: max-age` when present and clamped to 5 minutes–24 hours; `forta-api`
+serves `max-age=3600`). Once the entry is older than that, the next RS256 token re-fetches
+before verifying, so **a key removed from the published set stops verifying within the max age**.
+
+This is a **separate trigger** from the unknown-`kid` rate limit and does not weaken it: the age
+clock is driven by time, not by attacker-supplied `kid` values, and an age-based refresh never
+touches the rate limit's clock. A flood of forged `kid`s still produces at most one fetch per
+`JWKSMinRefreshInterval`.
+
+If a refresh fails, the existing cached keys keep being served — an unreachable JWKS endpoint
+must not become a platform-wide outage. A failed attempt does not extend the entry's age, so it
+retries (subject to a short backoff so a downed endpoint does not cost every request a timeout).
+
+## Token issuer
+
+The `iss` claim is checked against an allowlist. By default **both** of these are accepted:
+
+| Issuer | Status |
+| ------ | ------ |
+| `forta:auth-service` | **Legacy** — what tokens carry today. Transitional; it is not an https URL, so it can never be an OIDC discovery issuer. |
+| `https://auth.appleby.cloud` | **Target** — the `issuer` published in `forta-api`'s OIDC discovery document. OIDC Core §3.1.3.7 requires an id_token's `iss` to equal it exactly. |
+
+Accepting both means the issuer migration needs exactly one fleet redeploy: ship this SDK, roll
+it everywhere, then change what `forta-api` emits. `forta.DefaultAcceptedIssuers()` returns the
+list; `Config.AcceptedIssuers` overrides it exactly.
+
+> **⚠️ Upgrade ordering.** `forta-api` is migrating from HS512 to RS256 **and** will move its
+> token issuer to `https://auth.appleby.cloud`. Every service must be on v1.4.0+ **before**
+> either change lands — an older go-forta rejects RS256 tokens outright and rejects the URL
+> issuer outright. `keyring-api` first: it is the boot-time secret source for the platform.
 
 ---
 
@@ -217,7 +311,7 @@ func handleResource(w http.ResponseWriter, r *http.Request) {
 
 ```go
 forta.Setup(forta.Config{
-    APIDomain:   "https://api.forta.appleby.cloud",
+    APIDomain:   "https://auth.appleby.cloud",
     LoginDomain: "https://forta.appleby.cloud",
     ClientID:     "...",
     ClientSecret: "...",

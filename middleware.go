@@ -17,7 +17,11 @@ import (
 //   - Opaque API tokens (frt_…) are always validated remotely via /auth/self,
 //     since they carry no claims. Results are cached for APITokenCacheTTL,
 //     which also bounds how long a revoked token keeps working.
-//   - If Config.JWTSigningKey is set: JWTs are validated locally via HMAC-SHA512.
+//   - If Config.JWTSigningKey is set (or Config.EnableJWKS is true): JWTs are
+//     validated locally. Verification dispatches on the JWS header algorithm —
+//     HS512 uses the shared Config.JWTSigningKey, RS256 uses the issuer's
+//     public key looked up by "kid" from {APIDomain}/oauth/jwks. Any other
+//     algorithm, including "none", is rejected.
 //   - Otherwise: JWTs are validated remotely by calling /auth/self on the
 //     Forta API. The full User profile is then available via GetUserFromContext.
 //
@@ -50,9 +54,9 @@ func (c *Client) Protected(next http.HandlerFunc) http.HandlerFunc {
 			}
 			userID = u.ID
 			user = u
-		} else if c.cfg.JWTSigningKey != "" {
+		} else if c.cfg.JWTSigningKey != "" || c.cfg.EnableJWKS {
 			// ── Local JWT validation ─────────────────────────────────────────
-			id, err := validateAccessTokenLocal(tokenStr, c.cfg.JWTSigningKey)
+			id, err := c.validateAccessToken(r.Context(), tokenStr)
 			if err != nil {
 				if !isTokenExpiredError(err) || c.cfg.DisableAutoRefresh {
 					writeJSONError(w, http.StatusUnauthorized, "invalid or expired access token")

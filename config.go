@@ -3,6 +3,7 @@ package forta
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -11,7 +12,11 @@ import (
 type Config struct {
 	// APIDomain is the base URL of the Forta API server used for token exchange,
 	// token validation, and user info lookups.
-	// Required. Example: "https://api.forta.appleby.cloud"
+	// Required. Example: "https://auth.appleby.cloud"
+	//
+	// This must be the real Forta API host, because the JWKS endpoint is
+	// derived from it ({APIDomain}/oauth/jwks) and must agree with the
+	// "jwks_uri" advertised by the issuer's OIDC discovery document.
 	APIDomain string
 
 	// LoginDomain is the base URL of the Forta login UI used to build the
@@ -65,6 +70,55 @@ type Config struct {
 	// object is automatically available in the context.
 	JWTSigningKey string
 
+	// JWKSURL overrides where the issuer's public JSON Web Key Set is fetched
+	// from. Optional — when empty it defaults to {APIDomain}/oauth/jwks, which
+	// is correct for every real deployment. Mainly useful in tests.
+	//
+	// The key set is only ever fetched lazily, on the first RS256 token the
+	// process actually sees. A service that only receives HS512 tokens never
+	// makes a JWKS request.
+	JWKSURL string
+
+	// JWKSMinRefreshInterval is the minimum time between two JWKS fetches
+	// triggered by a token carrying an unknown key id. Optional — defaults to
+	// DefaultJWKSMinRefreshInterval (5 minutes).
+	//
+	// Lowering this shortens the window before a rotated signing key is picked
+	// up, at the cost of letting an attacker drive more JWKS traffic with
+	// forged "kid" values. Do not set it to zero-ish values in production.
+	JWKSMinRefreshInterval time.Duration
+
+	// JWKSMaxAge is how long a cached key set is served before it is re-fetched.
+	// Optional — defaults to DefaultJWKSMaxAge (1 hour). A Cache-Control
+	// max-age on the JWKS response takes precedence when present, clamped to
+	// [5 minutes, 24 hours]; forta-api serves "public, max-age=3600".
+	//
+	// This bounds **revocation** latency for a compromised signing key, which
+	// is a different problem from rotation: rotation is discovered by the
+	// unknown-kid re-fetch, but a key that is already cached is only ever
+	// re-checked because of this max age. It is independent of
+	// JWKSMinRefreshInterval and does not affect that rate limit.
+	JWKSMaxAge time.Duration
+
+	// AcceptedIssuers overrides the set of "iss" claim values accepted during
+	// local token validation. Optional — when empty, both the legacy
+	// "forta:auth-service" and the OIDC discovery issuer
+	// "https://auth.appleby.cloud" are accepted (see DefaultAcceptedIssuers).
+	//
+	// The URL form is the target; the legacy string is transitional and will be
+	// dropped once no live token carries it. Set this only if you need to pin a
+	// single issuer — the list is honoured exactly, with no defaults merged in.
+	AcceptedIssuers []string
+
+	// EnableJWKS opts in to local JWT validation with no shared HMAC secret at
+	// all — i.e. RS256-only. Optional, default false.
+	//
+	// It is not needed to accept RS256 tokens: whenever JWTSigningKey is set,
+	// local validation already accepts both HS512 (shared key) and RS256
+	// (JWKS). Set this only once the shared secret has been removed from the
+	// deployment, after forta-api has flipped to RS256.
+	EnableJWKS bool
+
 	// FetchUserOnProtect controls whether the Protected middleware fetches the
 	// full user profile from /oauth/userinfo on every authenticated request.
 	// Only relevant when JWTSigningKey is set (local validation). When false,
@@ -115,6 +169,24 @@ func (c Config) validate() error {
 		return errors.New("go-forta: Config.ClientSecret is required")
 	}
 	return nil
+}
+
+// jwksURL returns the JWKS endpoint to use, defaulting to the issuer's
+// well-known path on the configured API domain.
+func (c Config) jwksURL() string {
+	if c.JWKSURL != "" {
+		return c.JWKSURL
+	}
+	return strings.TrimRight(c.APIDomain, "/") + jwksPath
+}
+
+// acceptedIssuers returns the configured "iss" allowlist, falling back to the
+// package defaults when unset. The configured list is used exactly as given.
+func (c Config) acceptedIssuers() []string {
+	if len(c.AcceptedIssuers) > 0 {
+		return c.AcceptedIssuers
+	}
+	return defaultAcceptedIssuers
 }
 
 // postLoginRedirect returns the configured redirect URL with a safe default.

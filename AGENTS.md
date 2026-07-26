@@ -32,7 +32,9 @@ Two audiences:
 ## Stack & dependencies
 
 - **Go 1.22+**, standard library plus a single direct dependency:
-  `github.com/golang-jwt/jwt/v5` v5.2.2 (HMAC-SHA512).
+  `github.com/golang-jwt/jwt/v5` v5.2.2. Two signature algorithms are accepted:
+  **HS512** (shared secret, what `forta-api` signs with today) and **RS256**
+  (issuer public key from the published JWKS, the migration target).
 - No router, no SQL, no HTTP framework. Handlers are plain `http.HandlerFunc`.
 
 ## Project structure
@@ -48,7 +50,9 @@ Two audiences:
 | `grant_cache.go` | `grantCache` — TTL cache for grant-check results. |
 | `cookies.go` | Auth cookie read/write helpers, cookie name constants. |
 | `handlers.go` | The OAuth flow handlers. |
-| `token.go` | Local JWT validation helpers. |
+| `token.go` | Local JWT validation. The algorithm allowlist (`allowedSigningAlgs`), the issuer allowlist (`LegacyIssuer`/`Issuer`/`DefaultAcceptedIssuers`), the HS512/RS256 dispatch in `Client.validateAccessToken`, and the legacy `validateAccessTokenLocal`. |
+| `jwks.go` | `jwksCache` — lazy, in-memory JWKS client for RS256 public keys, with a rate-limited unknown-`kid` re-fetch and an independent max-age refresh. |
+| `token_test.go` | The test suite. Mostly security regression tests; read the comments before changing an assertion. |
 | `types.go` | Shared wire types + the `fortaEnvelope[T]` generic response wrapper. |
 | `errors.go` | Error helpers, `writeJSONError`, `writeGrantDenied`. |
 | `docs/implementation.md` | Full integration guide for consumers. |
@@ -59,14 +63,33 @@ Two audiences:
 ```bash
 dev build    # go build ./...
 dev vet      # go vet ./...
-dev test     # go test ./...   (currently: no test files)
+dev test     # go test ./...
 dev fmt      # gofmt -w -s .
 dev tidy     # go mod tidy
 ```
 
-**There are no tests in this repo.** That is a real gap for a library that gates authentication
-everywhere. Verification today is: it compiles, it vets, and consumers exercise it in
-production. Treat any behavioural change here as higher-risk than the line count suggests.
+**`token_test.go` is the only test file, and it exists to protect the JWT verification path.**
+Everything else in this repo (cookies, handlers, caches) is still untested — verification there
+is still "it compiles, it vets, consumers exercise it in production". Treat any behavioural
+change outside `token.go`/`jwks.go` as higher-risk than the line count suggests.
+
+The token tests are deliberately adversarial. In particular:
+
+| Test | What it protects |
+|------|------------------|
+| `TestAlgConfusion_RSAPublicKeyAsHMACSecret` | The RS256→HMAC key-confusion forgery. Signs HS512 tokens with the RSA public key in five encodings (PEM, trimmed PEM, DER, raw modulus, base64 modulus) against a *primed* JWKS cache — the exact state in which a naive verifier accepts them. |
+| `TestHMACAlgorithmIsHS512` | That the HMAC algorithm is **HS512**, not HS256. Narrowing the allowlist to HS256 rejects every real Forta token — a platform-wide auth outage. HS256/HS384 must be rejected even when signed with the correct secret. |
+| `TestAlgNone_Rejected` | Unsigned tokens, in every config. |
+| `TestUnknownKID_TriggersRefetch_ThenSucceeds` | OIDC key rotation is actually discovered. |
+| `TestUnknownKID_RefetchIsRateLimited` | 25 random `kid`s produce exactly **one** JWKS fetch. |
+| `TestHS512_StillVerifies_NoJWKSRequest` | An unchanged HS512 consumer makes **zero** JWKS requests — the `httptest` handler fails the test if it is hit at all. |
+| `TestJWKSMaxAge_WithdrawnKeyStopsVerifying` | **Revocation propagates.** A key the issuer withdraws (empty published set, or replaced by another key) stops verifying once the max age passes. Time is injected via the cache's unexported `now` field — never sleep here. |
+| `TestJWKSMaxAge_HonoursCacheControl` | `Cache-Control: max-age` wins over `JWKSMaxAge`, and is clamped to 5m–24h. |
+| `TestJWKSMaxAge_RefreshFailureKeepsServingCachedKeys` | A failed refresh serves the stale keys (no platform-wide outage) but does **not** extend the entry's age. |
+| `TestJWKSMaxAge_IndependentOfUnknownKIDRateLimit` | The two refresh triggers are independent: with `JWKSMinRefreshInterval` at 24h the age refresh still fires, and it does **not** reset the rate limit — 25 unknown `kid`s afterwards drive zero extra fetches. |
+| `TestAcceptedIssuers` | Both issuers verify, unrelated/empty/trailing-slash/lookalike issuers are rejected, and an explicit `AcceptedIssuers` list is honoured exactly. |
+
+Never "fix" a failing test here by relaxing an assertion. Each one encodes an attack.
 
 ## How code is written here
 
@@ -94,8 +117,8 @@ browsers), falling back to the `forta-access-token` cookie. Then:
 | Credential | Path | Notes |
 |-----------|------|-------|
 | **`frt_` API token** | Always **remote** — `resolveAPIToken` → `GET /auth/self`, memoized in `apiTokenCache` | Carries no claims, so it *cannot* be validated locally. Never auto-refreshed — long-lived by design. |
-| **Access JWT, `JWTSigningKey` set** | **Local** HMAC-SHA512 verify, no network | Fast path. On expiry, `tryRefresh` uses the refresh cookie unless `DisableAutoRefresh`. |
-| **Access JWT, no `JWTSigningKey`** | **Remote** — `getUserInfo` | Full `User` profile lands in context. |
+| **Access JWT, `JWTSigningKey` set (or `EnableJWKS`)** | **Local** verify, dispatching on the JWS `alg` header | HS512 → shared `JWTSigningKey`, no network. RS256 → issuer public key by `kid` from the JWKS. On expiry, `tryRefresh` uses the refresh cookie unless `DisableAutoRefresh`. |
+| **Access JWT, no `JWTSigningKey`, `EnableJWKS` false** | **Remote** — `getUserInfo` | Full `User` profile lands in context. Unchanged. |
 
 Then optional grant enforcement (`EnforceGrants`), then `contextWithFortaID` / `contextWithUser`.
 
@@ -104,14 +127,145 @@ services like `keyring-api` set `JWTSigningKey` and therefore take the local pat
 still resolve `frt_` tokens remotely. No configuration is needed to enable it — upgrading the
 module is sufficient.
 
+### JWT verification — algorithm dispatch (v1.4.0)
+
+`Client.validateAccessToken` parses the token **once**, with an explicit algorithm allowlist,
+and selects key material from the *verified* method type:
+
+| `alg` | Key material | Network |
+|-------|--------------|---------|
+| `HS512` | `Config.JWTSigningKey` (shared secret) | none |
+| `RS256` | Issuer public key, looked up by the token's `kid` in the cached JWKS | lazy fetch on first RS256 token / unknown `kid` |
+| anything else, incl. `none` | — rejected before the keyfunc runs — | none |
+
+Two independent controls make this safe, and **both must stay**:
+
+1. `jwt.WithValidMethods(allowedSigningAlgs)` on every `ParseWithClaims` call. The parser
+   rejects a token whose `alg` is not in the list *before* any key is selected, which kills
+   `alg: none` and any future downgrade.
+2. A **type switch on `t.Method`** inside the keyfunc — `*jwt.SigningMethodHMAC` returns only
+   the shared secret, `*jwt.SigningMethodRSA` returns only a JWKS public key. An RSA public key
+   can therefore never reach an HMAC verifier. Without this, an attacker signs an HS512 token
+   using the published RSA public key as the HMAC secret and it validates as genuine.
+
+**`allowedSigningAlgs` is a security boundary, not a config knob. Do not widen it.** It is
+`{"RS256", "HS512"}` — HS512 because that is literally what `forta-api` signs with
+(`forta/jwt.forta.go`: `jwt.SigningMethodHS512`). Adding HS256 "for compatibility" adds attack
+surface for an algorithm the issuer never emits. Narrowing it to HS256 by mistake rejects every
+real token in production.
+
+### The JWKS cache
+
+`jwks.go`. Fetches `{APIDomain}/oauth/jwks` (override with `Config.JWKSURL`), caches
+`kid → *rsa.PublicKey` in memory.
+
+- **Lazy.** The cache is constructed in `newClient` but performs **no I/O** until the first
+  RS256 token is actually presented. `Setup()` never gains a network dependency on `forta-api`,
+  and an HS512-only consumer never makes a single JWKS request. This is deliberate and load
+  bearing — `keyring-api` is the boot-time secret source for the whole platform, so the SDK
+  must not add a startup dependency in either direction.
+There are **two independent re-fetch triggers**, and they must stay independent. Merging them, or
+letting one reset the other's clock, reintroduces either a DoS amplifier or an unrevocable key.
+
+- **Trigger 1 — unknown `kid` (rotation).** An unknown `kid` triggers a re-fetch, which is how
+  OIDC Core §10.1.1 rotation is meant to work: the OP publishes a new key and RPs discover it on
+  first use. **Rate-limited** to at most one fetch per `JWKSMinRefreshInterval` (default **5
+  minutes**) across the whole key set. This is a security control: without it an attacker sending
+  tokens with random `kid` values turns every relying party into a DoS amplifier against the JWKS
+  endpoint. The cost is that a rotated key is discovered up to that long after publication — so
+  `forta-api` must overlap old and new keys for longer than this interval. Guarded by
+  `lastAttempt`, which **only** this trigger reads or writes.
+- **Trigger 2 — max age (revocation).** A cached key set older than its max age is re-fetched
+  before use. **Not** rate-limited by `JWKSMinRefreshInterval`: the trigger is the clock, not
+  attacker input, so it cannot amplify anything, and it never touches `lastAttempt`.
+  - The max age is `Config.JWKSMaxAge` (default `DefaultJWKSMaxAge`, **1 hour**), overridden by
+    the response's `Cache-Control: max-age` when present and clamped to **5 minutes – 24 hours**
+    (`forta-api` serves `public, max-age=3600`).
+  - **Why it exists:** before it, a `kid` already in the cache was *never* revalidated — no TTL,
+    no `Cache-Control` handling — so a signing key the issuer had withdrawn kept verifying tokens,
+    making no further network request, for the life of the process. Planned rotation was fine
+    (long overlap); **emergency revocation had no propagation mechanism at all.** Key removal now
+    propagates within the max age.
+  - **Failure posture is fail-open, without an age extension.** A failed refresh keeps serving the
+    cached keys — an unreachable JWKS endpoint must not become a platform-wide outage — and does
+    **not** update `fetchedAt`, so the entry stays stale and a later request retries. A short
+    backoff (`lastFailure`, its own clock, `minRefresh` long) stops a downed endpoint from costing
+    every request a fetch timeout.
+  - **An empty published key set is honoured when a set is already cached.** `{"keys":[]}` is how
+    the issuer performs an emergency revocation; ignoring it would defeat the entire mechanism.
+    It is still an error on the *first* fetch, so a misconfigured endpoint fails loudly at first
+    use rather than silently reporting every `kid` as unknown.
+- **Bounded.** 5s timeout, 1 MiB body limit, non-200 is an error. A single malformed key entry is
+  skipped rather than discarding the whole set.
+- A token with **no `kid`** is rejected without any fetch.
+- Concurrent misses for the same `kid` collapse into one fetch (`fetchMu`).
+- **The clock is injectable.** `jwksCache.now` (unexported, defaults to `time.Now`) exists so the
+  age tests advance time instead of sleeping. Do not add `time.Sleep` to these tests.
+
+### Token issuer — accepting both (v1.4.0)
+
+`parseAccessToken` checks `iss` against an allowlist rather than a single constant.
+
+| `iss` | Exported as | Status |
+|-------|-------------|--------|
+| `forta:auth-service` | `LegacyIssuer` | **Legacy** — what tokens carry today. Transitional. |
+| `https://auth.appleby.cloud` | `Issuer` | **Target** — the `issuer` in `forta-api`'s OIDC discovery document. |
+
+Both are accepted by default (`DefaultAcceptedIssuers()`); `Config.AcceptedIssuers` overrides the
+list **exactly**, with no defaults merged in. Comparison is exact — no normalisation of scheme,
+case, or trailing slash, because OIDC Core §3.1.3.7 requires an exact match.
+
+`forta:auth-service` is not an https URL, so it can never be a discovery issuer; tokens must
+eventually move to the URL form. That migration needs the same choreography as the HS512→RS256
+flip — ship an SDK accepting both, redeploy the fleet, then change what the server emits — so
+both changes ship in **this** release and the fleet redeploys **once** instead of twice.
+
+### RS256 + issuer migration — ordering matters
+
+`forta-api` is moving from HS512-with-a-shared-secret to RS256-with-a-published-JWKS, **and**
+from the `forta:auth-service` issuer to `https://auth.appleby.cloud`.
+
+> **⚠️ This SDK version must reach EVERY consumer BEFORE `forta-api` either flips to RS256 or
+> changes its token issuer.** A consumer still on an older go-forta sees an RS256 token, fails
+> the `*jwt.SigningMethodHMAC` check, and rejects every request; it also hard-compares `iss`
+> against `forta:auth-service` and rejects the URL form outright. **Upgrade `keyring-api`
+> first** — it is the boot-time secret source for the entire platform, so if it cannot validate a
+> Forta token, nothing starts.
+
+Rollout order:
+
+1. Tag this SDK; bump **every** consumer's `go.mod` and redeploy, `keyring-api` first. Nothing
+   changes behaviourally — the change is strictly additive, tokens are still HS512 and still
+   carry the legacy issuer. **This is the single fleet-wide redeploy; both migrations depend on
+   it, which is why they ship together.**
+2. `forta-api` publishes `/oauth/jwks` while still signing HS512.
+3. `forta-api` flips to RS256. Consumers pick up the key on the first RS256 token.
+4. `forta-api` changes `iss` to `https://auth.appleby.cloud`. Consumers already accept it.
+5. Only once all consumers are on RS256, drop the shared secret from deployments and set
+   `EnableJWKS: true` (which enables local validation with no `JWTSigningKey` at all).
+6. Once no live token carries `forta:auth-service`, drop `LegacyIssuer` from the defaults.
+
+Do not reorder these steps.
+
+### Scope — this is not a generic OIDC client
+
+`jwks.go` is deliberately **Forta-specific** and deliberately **not** a general-purpose OIDC/JWKS
+library. There is no discovery document (`/.well-known/openid-configuration`) support, no `aud`
+negotiation, no EC or symmetric JWK handling, no `x5c` chain validation — the issuer is a single
+known service, `typ: access` is hardcoded, and the `iss` allowlist is a fixed two-entry default
+(overridable, but not discovered). If you need generic OIDC, use a generic library; do not grow
+this one into one.
+
 ### Cache TTLs and revocation latency
 
 | Cache | Config | Default | What the TTL bounds |
 |-------|--------|---------|--------------------|
 | `apiTokenCache` | `APITokenCacheTTL` | 60s | How long a **revoked API token keeps working** in this service |
 | `grantCache` | `GrantCacheTTL` | 30s | How long a **revoked grant keeps working** |
+| `jwksCache` | `JWKSMinRefreshInterval` | 5m | How long after a **signing-key rotation** the new key is still unknown here (and the floor on JWKS request rate under `kid` flooding) |
+| `jwksCache` | `JWKSMaxAge` | 1h (or the response's `Cache-Control: max-age`, clamped 5m–24h) | How long a **withdrawn signing key keeps verifying tokens** here — i.e. emergency revocation latency |
 
-Both are the same trade: lower TTL = tighter revocation, more round-trips to Forta. State the
+These are all the same trade: lower TTL = tighter revocation, more round-trips to Forta. State the
 number when discussing revocation — "immediate" is only true at `forta-api` itself.
 
 ### Versioning
@@ -121,6 +275,15 @@ Tagged releases consumed via the Go module proxy, which caches immutably.
 **`v1.2.0` was already published, pointing at a commit predating API-token support.** Because
 proxy entries cannot be rewritten, that feature shipped as **v1.3.0**. Never retag a published
 version — cut a new one.
+
+**RS256/JWKS support plus dual-issuer acceptance is a minor bump — `v1.4.0`.** It adds exported
+surface (`Config.JWKSURL`, `Config.JWKSMinRefreshInterval`, `Config.JWKSMaxAge`,
+`Config.AcceptedIssuers`, `Config.EnableJWKS`, `DefaultJWKSMinRefreshInterval`,
+`DefaultJWKSMaxAge`, `DefaultAcceptedIssuers`, `LegacyIssuer`, `Issuer`, `ErrUnknownKeyID`) with
+zero-value-means-previous-behaviour defaults. Nothing is renamed or removed, and an HS512 consumer
+that upgrades and changes no configuration behaves identically — including making **zero** JWKS
+requests. The only behavioural widening is that `https://auth.appleby.cloud` is now also an
+accepted `iss`, which no token carries yet.
 
 ## Ecosystem & related repos
 
@@ -156,8 +319,22 @@ version — cut a new one.
   to compile if a field moves.
 - **Adding a `Config` field must stay backward compatible** — zero value means "previous
   behaviour". `APITokenCacheTTL <= 0` falling back to the default is the pattern to copy.
-- **No tests exist.** If you touch `middleware.go`, say so plainly in the handoff; there is no
-  safety net.
+- **Never widen `allowedSigningAlgs`.** It is `{"RS256", "HS512"}` and it is a security
+  boundary. Adding an algorithm the issuer does not emit is pure attack surface; removing HS512
+  is a platform-wide outage.
+- **Never return a key from the keyfunc without switching on `t.Method`**, and never make the
+  JWKS fetch eager (at package init or in `Setup`) — both are documented above with the reason.
+- **Never merge the two JWKS refresh triggers**, and never let one write the other's clock. The
+  unknown-`kid` limit (`lastAttempt`) is the DoS control; the max age (`fetchedAt`) is the
+  revocation control. Gating the age refresh behind the rate limit makes a compromised key
+  unrevocable; gating the rate limit on the age makes the SDK a traffic amplifier.
+- **Never fail closed on a JWKS refresh error**, and never update `fetchedAt` on a failed
+  attempt — the first turns an endpoint blip into a platform outage, the second silently grants a
+  withdrawn key another full max age.
+- **Do not "normalise" the `iss` comparison** (trailing slash, case, scheme). OIDC Core §3.1.3.7
+  requires an exact match; loosening it accepts lookalike issuers.
+- **No tests exist outside `token_test.go`.** If you touch `middleware.go`, say so plainly in
+  the handoff; there is no safety net for the cookie/handler/cache paths.
 
 ## Verification — always before "done"
 
@@ -165,7 +342,8 @@ version — cut a new one.
 gofmt -w .
 go build ./...
 go vet ./...
-go test ./...   # no test files today, but must stay green
+go test ./...
+go test -race ./...
 ```
 
 Then verify against a **real consumer**, because compiling proves very little for this module:
@@ -188,6 +366,9 @@ curl -H "Authorization: Bearer frt_notarealtoken" https://keys.appleby.cloud/adm
 ## Keeping this file updated
 
 Update this AGENTS.md in the same change when you:
+- **Change the algorithm allowlist, the issuer allowlist, the keyfunc dispatch, or either JWKS
+  refresh trigger** → update *JWT verification*, *The JWKS cache*, *Token issuer*, and the TTL
+  table. These are the sections an agent reads before touching auth.
 - **Add/change a `Config` field** → update *Domain & architecture* and the TTL table.
 - **Change `Protected`'s decision tree or `extractToken`** → update the credential table.
 - **Add or change a cache** → update the TTL/revocation table; those numbers get quoted in
