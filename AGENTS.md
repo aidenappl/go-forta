@@ -59,13 +59,31 @@ Three audiences:
 - `sso/ssotest`: `golang-jwt/jwt/v5` only, and **test-only**.
 - No router, no SQL, no HTTP framework, no logger. Handlers are plain `http.HandlerFunc`.
 
-⚠️ **The `sso` dependencies are module-wide, and that is the cost of keeping one repo.** A
-service importing only the root package for token validation still gets `go-oidc`,
-`x/oauth2` and `go-jose` in its `go.sum` and dependency graph. It does not get them in its
-binary — Go links per package — and `govulncheck` is call-graph aware, so an advisory in code a
-service cannot reach is not reported for it. What it does mean: a change confined to `sso/`
-still produces a new module version, so token-only consumers see a version bump they did not
-need. That was the accepted trade when `go-sso` was folded in rather than kept separate.
+### What folding `sso` in actually costs — measured, not assumed
+
+The obvious worry is that every token-validating service now inherits `go-oidc`, `x/oauth2` and
+`go-jose`. **It does not.** Verified against the module proxy at v1.6.0 with two scratch
+consumers:
+
+| Consumer imports | Its `go.sum` contains |
+|---|---|
+| `forta` only | `go-forta`, `golang-jwt/jwt/v5` — **and nothing else** |
+| `forta` + `forta/sso` | those two plus `go-oidc/v3`, `x/oauth2`, `go-jose/v4` |
+
+Go 1.17+ module-graph pruning is why: the requirements live in *this* module's `go.mod`, but a
+consumer only records what the packages it actually imports need. So `keyring-api`, which
+validates tokens and never logs anyone in, keeps the same two-line `go.sum` it had before.
+
+⚠️ **One real cost remains, and it is release coupling.** A change confined to `sso/` still
+produces a new module version, so token-only consumers see a bump they did not need — exactly
+what happened on 2026-07-29 when a lint-only fix cost two production redeploys. That is the
+accepted trade for one repo and one tag; it is recorded here so a future reader does not
+rediscover it as a surprise.
+
+Also note `go get github.com/aidenappl/go-forta@vX` alone is **not sufficient** for a consumer
+that imports the subpackage — the build fails with `missing go.sum entry`. Use
+`go get github.com/aidenappl/go-forta/sso@vX` (or `go mod tidy`), which the error message
+itself tells you.
 
 ## Project structure
 
