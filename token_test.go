@@ -25,11 +25,18 @@ const testHMACKey = "test-hmac-signing-key-do-not-use-in-production"
 // ── helpers ─────────────────────────────────────────────────────────────────
 
 // newTestClaims builds a well-formed Forta access-token claim set.
+//
+// The issuer is Issuer, not LegacyIssuer. Every test in this file that is not
+// ABOUT issuers uses this helper, so the value here has to be one the default
+// configuration accepts — otherwise a change to the accepted set breaks dozens
+// of tests that have nothing to do with issuers, which is exactly what happened
+// when LegacyIssuer left the default set. Issuer-specific behaviour is asserted
+// in TestAcceptedIssuers, which builds its own claims.
 func newTestClaims(sub string) FortaClaims {
 	return FortaClaims{
 		Type: jwtAccessTokenType,
 		RegisteredClaims: jwt.RegisteredClaims{
-			Issuer:    jwtIssuer,
+			Issuer:    Issuer,
 			Subject:   sub,
 			IssuedAt:  jwt.NewNumericDate(time.Now().Add(-time.Minute)),
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
@@ -817,11 +824,15 @@ func TestJWKSMaxAge_IndependentOfUnknownKIDRateLimit(t *testing.T) {
 
 // ── Issuer acceptance ───────────────────────────────────────────────────────
 
-// TestAcceptedIssuers covers the dual-issuer window. Tokens carry
-// "forta:auth-service" today; the OIDC discovery document forta-api publishes
-// advertises "https://auth.appleby.cloud", and OIDC Core §3.1.3.7 requires an
-// id_token's iss to equal the discovery issuer exactly. Accepting both here
-// means the fleet redeploys once, not twice.
+// TestAcceptedIssuers covers issuer acceptance AFTER the migration completed.
+//
+// The dual-issuer window is CLOSED: forta-api has minted
+// "https://auth.appleby.cloud" on every token since 2026-07-28, and
+// "forta:auth-service" is no longer in the default accepted set. These
+// assertions were inverted rather than deleted — the old value being accepted
+// was the truth and was pinned; the old value being REJECTED is the truth now
+// and is pinned just as hard, because silently re-widening the set would
+// reintroduce a non-URL issuer that can never satisfy OIDC Core §3.1.3.7.
 func TestAcceptedIssuers(t *testing.T) {
 	secret := []byte(testHMACKey)
 
@@ -831,7 +842,7 @@ func TestAcceptedIssuers(t *testing.T) {
 		return signHS512(t, cl, secret)
 	}
 
-	t.Run("defaults accept both issuers", func(t *testing.T) {
+	t.Run("defaults accept the discovery issuer alone", func(t *testing.T) {
 		c := testClient(t, func(cfg *Config) { cfg.JWTSigningKey = testHMACKey })
 
 		tests := []struct {
@@ -839,8 +850,8 @@ func TestAcceptedIssuers(t *testing.T) {
 			issuer string
 			wantOK bool
 		}{
-			{"legacy issuer, what tokens carry today", LegacyIssuer, true},
-			{"discovery issuer, the migration target", Issuer, true},
+			{"legacy issuer is NO LONGER accepted by default", LegacyIssuer, false},
+			{"discovery issuer, the only default", Issuer, true},
 			{"unrelated issuer", "https://evil.example.com", false},
 			{"empty issuer", "", false},
 			{"issuer with a trailing slash is not the same string", Issuer + "/", false},
@@ -865,11 +876,29 @@ func TestAcceptedIssuers(t *testing.T) {
 		}
 	})
 
-	t.Run("legacy validateAccessTokenLocal accepts both too", func(t *testing.T) {
+	t.Run("the legacy issuer can still be opted back in explicitly", func(t *testing.T) {
+		// The constant is retained precisely so a service that has not yet
+		// redeployed, or that must absorb an idle session, can name it. This is the
+		// documented escape hatch; if it stops working, the hatch is a lie.
+		c := testClient(t, func(cfg *Config) {
+			cfg.JWTSigningKey = testHMACKey
+			cfg.AcceptedIssuers = []string{LegacyIssuer, Issuer}
+		})
 		for _, iss := range []string{LegacyIssuer, Issuer} {
-			if _, err := validateAccessTokenLocal(tokenWithIssuer(iss), testHMACKey); err != nil {
-				t.Fatalf("issuer %q rejected by validateAccessTokenLocal: %v", iss, err)
+			if _, err := c.validateAccessToken(context.Background(), tokenWithIssuer(iss)); err != nil {
+				t.Fatalf("issuer %q rejected despite being named in AcceptedIssuers: %v", iss, err)
 			}
+		}
+	})
+
+	t.Run("validateAccessTokenLocal follows the same default", func(t *testing.T) {
+		if _, err := validateAccessTokenLocal(tokenWithIssuer(Issuer), testHMACKey); err != nil {
+			t.Fatalf("discovery issuer rejected by validateAccessTokenLocal: %v", err)
+		}
+		// The deprecated helper takes no config, so it cannot opt back in — it
+		// follows the package default, and must not lag behind it.
+		if _, err := validateAccessTokenLocal(tokenWithIssuer(LegacyIssuer), testHMACKey); err == nil {
+			t.Fatal("validateAccessTokenLocal still accepts the legacy issuer — the deprecated helper must not be a bypass for the narrowed default")
 		}
 		if _, err := validateAccessTokenLocal(tokenWithIssuer("nope"), testHMACKey); err == nil {
 			t.Fatal("unrelated issuer was ACCEPTED by validateAccessTokenLocal")
@@ -887,18 +916,18 @@ func TestAcceptedIssuers(t *testing.T) {
 		}
 		for _, iss := range []string{LegacyIssuer, Issuer} {
 			if _, err := c.validateAccessToken(context.Background(), tokenWithIssuer(iss)); err == nil {
-				t.Fatalf("default issuer %q was accepted despite an explicit AcceptedIssuers list", iss)
+				t.Fatalf("issuer %q was accepted despite an explicit AcceptedIssuers list that omits it", iss)
 			}
 		}
 	})
 
 	t.Run("DefaultAcceptedIssuers returns a copy callers cannot corrupt", func(t *testing.T) {
 		got := DefaultAcceptedIssuers()
-		if len(got) != 2 || got[0] != LegacyIssuer || got[1] != Issuer {
-			t.Fatalf("DefaultAcceptedIssuers() = %v", got)
+		if len(got) != 1 || got[0] != Issuer {
+			t.Fatalf("DefaultAcceptedIssuers() = %v, want exactly [%s] — the legacy issuer left the default set when the migration completed", got, Issuer)
 		}
 		got[0] = "https://attacker.example.com"
-		if DefaultAcceptedIssuers()[0] != LegacyIssuer {
+		if DefaultAcceptedIssuers()[0] != Issuer {
 			t.Fatal("mutating the returned slice corrupted the package defaults")
 		}
 

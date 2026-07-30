@@ -141,17 +141,21 @@ platform-wide outage — and the failed attempt does not extend the entry's age,
 
 ## Token issuer
 
-Both issuer values are accepted by default:
+One issuer value is accepted by default, as of v1.5.0:
 
 | `iss` | Status |
 | ----- | ------ |
-| `forta:auth-service` | **Legacy** — what Forta tokens carry today. Transitional. |
-| `https://auth.appleby.cloud` | **Target** — the `issuer` in `forta-api`'s OIDC discovery document. |
+| `https://auth.appleby.cloud` | **The only default** — the `issuer` in `forta-api`'s OIDC discovery document. |
+| `forta:auth-service` | **Retired in v1.5.0** — no longer accepted by default. Name it in `Config.AcceptedIssuers` to accept it. |
 
-`forta:auth-service` is not an https URL, so it can never be an OIDC discovery issuer, and OIDC
-Core §3.1.3.7 requires an id_token's `iss` to equal the discovery issuer exactly. Tokens must
-therefore move to the URL form. Accepting both now means the fleet redeploys **once** for both
-this and the RS256 flip, instead of twice.
+`forta:auth-service` was never an https URL, so it could never be an OIDC discovery issuer, and
+OIDC Core §3.1.3.7 requires an id_token's `iss` to equal the discovery issuer exactly. v1.4.0
+accepted both so the fleet redeployed once; `forta-api` has minted the URL form since
+2026-07-28, and v1.5.0 drops the old value.
+
+A refresh token minted before that cut-over could still be presented until 2026-08-04; it now
+fails and the user logs in again. That is a forced re-login for an idle session, not an outage —
+an active session rolled over automatically on its first refresh.
 
 `forta.DefaultAcceptedIssuers()` returns the default list. `Config.AcceptedIssuers` overrides it
 exactly — no defaults are merged in.

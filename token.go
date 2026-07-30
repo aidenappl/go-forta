@@ -10,13 +10,19 @@ import (
 )
 
 const (
-	// LegacyIssuer is the "iss" claim Forta access tokens carry today.
+	// LegacyIssuer is the "iss" claim Forta access tokens carried BEFORE the
+	// issuer migration. It is no longer accepted by default.
 	//
-	// It is **transitional**. It is not a URL, so it can never be the issuer
-	// identifier in an OIDC discovery document, and OIDC Core §3.1.3.7 requires
-	// an id_token's "iss" to equal the discovery issuer exactly. Tokens will
-	// move to Issuer; this value exists so the fleet keeps working until they
-	// do, and it will be removed once no live token carries it.
+	// ⚠️ IT IS NO LONGER IN defaultAcceptedIssuers. A token carrying it is
+	// REJECTED unless a caller opts back in explicitly via
+	// Config.AcceptedIssuers. The constant is retained — not deleted — for two
+	// reasons: a service that has not yet redeployed can name it to buy time, and
+	// deleting an exported identifier is a breaking API change for a value that
+	// costs one line to keep.
+	//
+	// It is not a URL, so it could never be the issuer identifier in an OIDC
+	// discovery document, and OIDC Core §3.1.3.7 requires an id_token's "iss" to
+	// equal the discovery issuer exactly. That is why it had to go.
 	LegacyIssuer = "forta:auth-service"
 
 	// Issuer is the **target** "iss" value — the issuer identifier published in
@@ -34,15 +40,31 @@ const (
 // defaultAcceptedIssuers is the "iss" allowlist used when Config.AcceptedIssuers
 // is empty.
 //
-// Both values are accepted so the issuer migration needs exactly ONE fleet
-// redeploy: ship an SDK that takes both, roll it everywhere, then change what
-// forta-api emits. This mirrors the HS512→RS256 choreography, and doing them in
-// the same release means the fleet redeploys once rather than twice.
-var defaultAcceptedIssuers = []string{LegacyIssuer, Issuer}
+// ─────────────────────────────────────────────────────────────────────────────
+// THE MIGRATION IS COMPLETE. This is now Issuer ALONE.
+//
+// The dual-acceptance window ran from v1.4.0 (which shipped both values so the
+// fleet needed exactly ONE redeploy) to this release. forta-api has minted the
+// new issuer on every token since 2026-07-28, and access tokens live ten
+// minutes, so nothing carrying the old value can have been minted recently.
+//
+// ⚠️ WHAT THIS DOES COST, stated plainly rather than glossed: a REFRESH token
+// minted before the cut-over lives seven days, so one may still be presented
+// until 2026-08-04. Presenting it now fails, and the user logs in again. That is
+// the whole cost — a forced re-login for a session that has been idle since
+// before the cut-over, not a service outage. An ACTIVE session re-mints both
+// tokens on every refresh, so anyone who has used the platform since the
+// cut-over rolled onto the new issuer automatically and is unaffected.
+//
+// A service that cannot absorb that can set Config.AcceptedIssuers to
+// []string{LegacyIssuer, Issuer} explicitly. Nothing in this repo does.
+// ─────────────────────────────────────────────────────────────────────────────
+var defaultAcceptedIssuers = []string{Issuer}
 
 // DefaultAcceptedIssuers returns a copy of the "iss" values accepted when
-// Config.AcceptedIssuers is not set: the legacy "forta:auth-service" and the
-// OIDC discovery issuer "https://auth.appleby.cloud".
+// Config.AcceptedIssuers is not set: the OIDC discovery issuer
+// "https://auth.appleby.cloud", and — since the issuer migration completed —
+// nothing else. LegacyIssuer must now be named explicitly to be accepted.
 func DefaultAcceptedIssuers() []string {
 	out := make([]string, len(defaultAcceptedIssuers))
 	copy(out, defaultAcceptedIssuers)

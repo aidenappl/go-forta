@@ -202,23 +202,36 @@ letting one reset the other's clock, reintroduces either a DoS amplifier or an u
 - **The clock is injectable.** `jwksCache.now` (unexported, defaults to `time.Now`) exists so the
   age tests advance time instead of sleeping. Do not add `time.Sleep` to these tests.
 
-### Token issuer — accepting both (v1.4.0)
+### Token issuer — migration COMPLETE (v1.5.0)
 
 `parseAccessToken` checks `iss` against an allowlist rather than a single constant.
 
 | `iss` | Exported as | Status |
 |-------|-------------|--------|
-| `forta:auth-service` | `LegacyIssuer` | **Legacy** — what tokens carry today. Transitional. |
-| `https://auth.appleby.cloud` | `Issuer` | **Target** — the `issuer` in `forta-api`'s OIDC discovery document. |
+| `https://auth.appleby.cloud` | `Issuer` | **The only default.** The `issuer` in `forta-api`'s OIDC discovery document. |
+| `forta:auth-service` | `LegacyIssuer` | **Retired in v1.5.0** — no longer accepted by default. Constant retained; must be named explicitly. |
 
-Both are accepted by default (`DefaultAcceptedIssuers()`); `Config.AcceptedIssuers` overrides the
-list **exactly**, with no defaults merged in. Comparison is exact — no normalisation of scheme,
-case, or trailing slash, because OIDC Core §3.1.3.7 requires an exact match.
+Comparison is exact — no normalisation of scheme, case, or trailing slash, because OIDC Core
+§3.1.3.7 requires an exact match. `Config.AcceptedIssuers` overrides the default **exactly**,
+with no defaults merged in.
 
-`forta:auth-service` is not an https URL, so it can never be a discovery issuer; tokens must
-eventually move to the URL form. That migration needs the same choreography as the HS512→RS256
-flip — ship an SDK accepting both, redeploy the fleet, then change what the server emits — so
-both changes ship in **this** release and the fleet redeploys **once** instead of twice.
+**The dual-acceptance window ran from v1.4.0 to v1.5.0.** v1.4.0 accepted both so the fleet
+needed exactly one redeploy; `forta-api` has minted the URL form on every token since
+2026-07-28; v1.5.0 narrows the default to that value alone.
+
+⚠️ **What narrowing costs, stated plainly.** A *refresh* token minted before the cut-over lives
+seven days, so one could still be presented until 2026-08-04. Presenting it now fails and the
+user logs in again. That is the entire cost — a forced re-login for a session idle since before
+the cut-over, **not** a service outage. An active session re-mints both tokens on every refresh,
+so anyone who has used the platform since 2026-07-28 rolled over automatically.
+
+A service that cannot absorb even that can opt back in explicitly:
+
+```go
+cfg.AcceptedIssuers = []string{forta.LegacyIssuer, forta.Issuer}
+```
+
+That escape hatch is covered by a test, so it cannot rot. Nothing in the fleet uses it.
 
 ### RS256 + issuer migration — ordering matters
 
@@ -243,9 +256,17 @@ Rollout order:
 4. `forta-api` changes `iss` to `https://auth.appleby.cloud`. Consumers already accept it.
 5. Only once all consumers are on RS256, drop the shared secret from deployments and set
    `EnableJWKS: true` (which enables local validation with no `JWTSigningKey` at all).
-6. Once no live token carries `forta:auth-service`, drop `LegacyIssuer` from the defaults.
+6. ~~Once no live token carries `forta:auth-service`, drop `LegacyIssuer` from the defaults.~~
+   **Done in v1.5.0.**
 
 Do not reorder these steps.
+
+⚠️ **Step 5 has a trap on the `forta-api` side, and it is not this SDK's to fix.** `forta-api`
+cannot drop `JWT_SIGNING_KEY` when its consumers do: that variable is `getEnvRequired` there
+*and* still signs the internal OAuth request token, so removing it stops the server booting and
+breaks `/oauth/authorize`. Consumers dropping `FORTA_JWT_SIGNING_KEY` is a separate, safe action.
+Do not read "drop the shared secret from deployments" as including the identity provider's own
+copy.
 
 ### Scope — this is not a generic OIDC client
 
