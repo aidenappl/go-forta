@@ -1,10 +1,24 @@
 # go-forta
 
-Go client library for integrating [Forta](https://forta.appleby.cloud) as an authentication provider into any service.
+Go SDK for the Forta identity platform: **token validation** for services that delegate auth to
+Forta, and a **complete SSO login flow** for services that keep their own user accounts.
 
-`go-forta` handles the full OAuth2 lifecycle — login, callback, token validation, auto-refresh, and logout — so your service only needs to register three handlers and wrap protected routes with a single middleware call.
+> **appleby.cloud platform** · Go SDK · `github.com/aidenappl/go-forta`
 
 ---
+
+⚠️ **Two packages, two different jobs.** Pick the one that matches your question:
+
+| Package | Question it answers | Runs | Works with |
+|---------|--------------------|------|-----------|
+| `forta` (root) | "Is this Forta token valid, and whose is it?" | Every authenticated request | Forta only |
+| [`forta/sso`](sso) | "Log this person in through an identity provider" | Once at login, plus a periodic checkpoint | **Any** OIDC provider |
+
+Use the **root** package when your service has fully delegated identity to Forta — no local user
+table, just "here is a token, tell me who it is."
+
+Use **`sso`** when your service has **its own** user accounts and wants SSO as a way to sign into
+them. A service may import both; most import one.
 
 ## Installation
 
@@ -50,6 +64,69 @@ func handleMe(w http.ResponseWriter, r *http.Request) {
 ```
 
 ---
+
+## SSO login (`forta/sso`)
+
+Runs the relying-party half of an OAuth2/OIDC login against **any** compliant provider, and hands
+you a normalized identity. It knows nothing about your users: three interfaces in
+[`sso/seams.go`](sso/seams.go) are the whole contract, so you keep your own schema and session
+model.
+
+```go
+import sso "github.com/aidenappl/go-forta/sso"
+
+p := &sso.Provider{
+    Slug:         "forta",
+    DisplayName:  "Appleby Cloud",
+    Kind:         sso.KindOIDC,
+    IssuerURL:    "https://auth.appleby.cloud",
+    ClientID:     clientID,
+    ClientSecret: clientSecret,
+    RedirectURL:  "https://app.example/auth/sso/callback",
+
+    AllowAutoLink: true, // verified-both-sides only
+    AutoProvision: true, // creates a pending account
+}
+
+// 1. Start a login.
+state, nonce, verifier, err := sso.GenerateState(ctx, stateStore, p.Slug, returnURL)
+adapter, err := sso.NewAdapter(ctx, p)
+url, err := adapter.AuthCodeURL(state, nonce, verifier)
+
+// 2. Handle the callback.
+sd, err := sso.ConsumeState(ctx, stateStore, r.URL.Query().Get("state"))
+id, tokens, err := adapter.Exchange(ctx, r.URL.Query().Get("code"), sd.Verifier, sd.Nonce)
+userID, err := resolver.ResolveUser(ctx, p, *id)
+
+// 3. On subsequent requests.
+switch checkpointer.Check(ctx, userID) {
+case sso.CheckpointOK:          // proceed
+case sso.CheckpointRevoked:     // 401, end the session
+case sso.CheckpointUnavailable: // 503 + Retry-After — NOT 401
+}
+```
+
+### Five invariants, none configurable
+
+1. Identity is `(Provider, Subject)` — **never email**.
+2. PKCE S256 is always generated and always sent.
+3. `nonce` is always verified on an id_token.
+4. `state` is single-use and server-side.
+5. A UserInfo `sub` that disagrees with the id_token discards the whole response
+   (OIDC Core §5.3.2).
+
+Each was found missing in an implementation already running in production, where a working login
+revealed nothing. That is the argument for a shared package here.
+
+⚠️ **`returnURL` must already be sanitised** — this package stores and returns it verbatim and
+cannot tell a same-site path from an attacker's host. An unsanitised value is an open redirect at
+the end of an authenticated flow.
+
+⚠️ **`CheckpointUnavailable` is a 503, not a 401.** A 401 sends every client to re-authenticate
+against the identity provider that is already down.
+
+Full details — the seams, the checkpoint decision table, and why the test fixture is a real
+server rather than a mock — in [`AGENTS.md`](AGENTS.md).
 
 ## Documentation
 

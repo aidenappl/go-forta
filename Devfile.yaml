@@ -21,7 +21,7 @@ commands:
       syncAfter: false
     - name: check
       description: Run all checks
-      run: gofmt -w -s . && go vet ./... && go test ./...
+      run: gofmt -w -s . && go vet ./... && go test ./... && golangci-lint run --timeout=5m
       syncAfter: false
     - name: tidy
       description: Tidy dependencies

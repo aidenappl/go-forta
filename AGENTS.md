@@ -18,24 +18,54 @@
 
 ## What this repo is
 
-A small, dependency-light Go module (`module github.com/aidenappl/go-forta`, `go 1.22`)
-published by git tag and consumed via the Go module proxy. It is **not a service** — there is
-no `main`, no Docker image, no deployment.
+A Go module (`module github.com/aidenappl/go-forta`, `go 1.25`) published by git tag and
+consumed via the Go module proxy. It is **not a service** — no `main`, no Docker image, no
+deployment.
 
-Two audiences:
+⚠️ **It contains TWO packages that answer DIFFERENT questions. Do not conflate them.**
 
-1. **Consuming services** — call `forta.Setup(...)` once, then use `forta.LoginHandler`,
-   `forta.CallbackHandler`, `forta.LogoutHandler`, and `forta.Protected(next)`.
-2. **`forta-api` itself** — imports the shared types (`FortaClaims`, `TokenPair`, `User`,
+| Package | Question it answers | Runs | Works with |
+|---------|--------------------|------|-----------|
+| `forta` (root) | "Is this Forta token valid, and whose is it?" | Every authenticated request | Forta only |
+| `forta/sso` | "Log this person in through an identity provider" | Once at login, plus a periodic checkpoint | **Any** OIDC provider |
+
+Use the ROOT package when your service has fully delegated identity to Forta: no local user
+table, just "here is a token, tell me who it is."
+
+Use **`sso/`** when your service has **its own user accounts** and wants SSO as a way to sign
+into them. `monitor-core` is the example — native email/password accounts *and* pluggable SSO,
+so it needs to run a login flow and map the result onto its own users.
+
+A service may legitimately import both. Most import only one.
+
+Three audiences:
+
+1. **Consuming services (token validation)** — call `forta.Setup(...)` once, then use
+   `forta.LoginHandler`, `forta.CallbackHandler`, `forta.LogoutHandler`, `forta.Protected(next)`.
+2. **Consuming services (SSO login)** — implement the three interfaces in `sso/seams.go`, then
+   drive `sso.GenerateState` → `sso.NewAdapter` → `Exchange` → your own session.
+3. **`forta-api` itself** — imports the shared types (`FortaClaims`, `TokenPair`, `User`,
    `AuthResponse`, `OAuthUserInfoResponse`) so the wire format has exactly one definition.
 
 ## Stack & dependencies
 
-- **Go 1.22+**, standard library plus a single direct dependency:
-  `github.com/golang-jwt/jwt/v5` v5.2.2. Two signature algorithms are accepted:
-  **HS512** (shared secret, what `forta-api` signs with today) and **RS256**
-  (issuer public key from the published JWKS, the migration target).
-- No router, no SQL, no HTTP framework. Handlers are plain `http.HandlerFunc`.
+- **Go 1.25+**
+- Root `forta` package: standard library plus `github.com/golang-jwt/jwt/v5`. Two signature
+  algorithms are accepted: **RS256** (issuer public key from the published JWKS — what
+  `forta-api` signs with) and **HS512** (shared secret, pre-cut-over tokens only).
+- `sso` package: `github.com/coreos/go-oidc/v3` (discovery, JWKS, id_token verification) and
+  `golang.org/x/oauth2` (the code flow, `GenerateVerifier`, `S256ChallengeOption`,
+  `VerifierOption`). `go-jose/go-jose/v4` arrives indirectly through `go-oidc`.
+- `sso/ssotest`: `golang-jwt/jwt/v5` only, and **test-only**.
+- No router, no SQL, no HTTP framework, no logger. Handlers are plain `http.HandlerFunc`.
+
+⚠️ **The `sso` dependencies are module-wide, and that is the cost of keeping one repo.** A
+service importing only the root package for token validation still gets `go-oidc`,
+`x/oauth2` and `go-jose` in its `go.sum` and dependency graph. It does not get them in its
+binary — Go links per package — and `govulncheck` is call-graph aware, so an advisory in code a
+service cannot reach is not reported for it. What it does mean: a change confined to `sso/`
+still produces a new module version, so token-only consumers see a version bump they did not
+need. That was the accepted trade when `go-sso` was folded in rather than kept separate.
 
 ## Project structure
 
@@ -57,6 +87,21 @@ Two audiences:
 | `errors.go` | Error helpers, `writeJSONError`, `writeGrantDenied`. |
 | `docs/implementation.md` | Full integration guide for consumers. |
 | `docs/server.md` | Type-mapping guide for `forta-api`. |
+
+### `sso/` — the SSO login flow
+
+| Path | Role |
+|------|------|
+| `sso/provider.go` | `Provider` (a plain struct, **not** a schema), `Kind`, `Validate()`. The package doc lives here and states the five invariants. |
+| `sso/identity.go` | `Identity`, `TokenSet`, the `Adapter` interface, `NewAdapter`. |
+| `sso/seams.go` | **The three interfaces.** `StateStore`, `UserResolver`, `SessionStore`, plus the optional `LocalTokenRevoker`. Read this first. |
+| `sso/state.go` | `GenerateState`, `GenerateLinkState`, `ConsumeState`, `StateData`. |
+| `sso/oidc.go` | The OIDC adapter, discovery cache, claim readers, shared HTTP client and byte limits. |
+| `sso/oauth2.go` | The plain-OAuth2 adapter. Strictly weaker; read its type comment before using it. |
+| `sso/introspect.go` | RFC 7662 client. Distinguishes `active:false` from "no answer". |
+| `sso/checkpoint.go` | `Checkpointer`, `CheckpointResult`, the interval and the bounded grace window. |
+| `sso/ssotest/fakeidp.go` | A protocol-correct fake OIDC provider with per-defect failure injection. **Test-only.** |
+| `sso/ssotest/store.go` | In-memory `StateStore` and `SessionStore` for tests. |
 
 ## Running, building & testing
 
@@ -306,6 +351,119 @@ that upgrades and changes no configuration behaves identically — including mak
 requests. The only behavioural widening is that `https://auth.appleby.cloud` is now also an
 accepted `iss`, which no token carries yet.
 
+## The `sso` package — SSO login
+
+### Why it exists
+
+Three services each grew their own SSO flow, and the copies drifted in ways a working login does
+not reveal:
+
+| Defect found | Consequence |
+|---|---|
+| A PKCE verifier generated, then dropped at the token exchange | PKCE configured, visible in logs, defending nothing |
+| Identity keyed on **email** rather than `(provider, subject)` | Account takeover as soon as an address is reassigned |
+| `nonce` never verified — `go-oidc`'s `Verify()` does not check it | id_token injection across sessions |
+| No bound on trusting a stale introspection result | Revocation unenforceable whenever the IdP path can be degraded |
+
+Every one is silent. The fix is not more review; it is one implementation where the defended path
+is the only path.
+
+### The five invariants — not configurable, by design
+
+1. Identity is `(Provider, Subject)`. **Never email.**
+2. PKCE S256 is always generated and always sent.
+3. `nonce` is always verified on an id_token.
+4. `state` is single-use, server-side, never derived from a cookie.
+5. A UserInfo `sub` that differs from the id_token `sub` **discards the whole response**
+   (OIDC Core §5.3.2).
+
+Each was found missing in something already in production. There is no option to switch any off.
+
+### The flow
+
+```
+GenerateState ──▶ AuthCodeURL ──▶ [browser → IdP] ──▶ callback
+                                                         │
+                                    ConsumeState ◀────────┘
+                                          │
+                                     Exchange ──▶ Identity
+                                                     │
+                                            UserResolver.ResolveUser
+                                                     │
+                                             your session
+```
+
+Then, on subsequent requests: `Checkpointer.Check`.
+
+### The three seams
+
+The package knows nothing about users, sessions or schemas — deliberately, because the three
+adopting services have three different ones and one has no provider table at all.
+
+| Interface | You provide | The hazard if you get it wrong |
+|---|---|---|
+| `StateStore` | Atomic single-use storage for in-flight logins | **A non-atomic `ConsumeState` lets a replayed state authenticate alongside the real callback.** `SELECT` then `DELETE` does *not* satisfy it — use one conditional statement and let the row lock arbitrate. |
+| `UserResolver` | identity → your user, provisioning, linking | Linking without **both** sides' emails verified is pre-account-takeover: an attacker plants an unverified native account on the victim's address, and the victim's later SSO login binds onto it. |
+| `SessionStore` | Cached IdP tokens for the checkpoint | Returning an error instead of `(nil, nil)` for a native login **logs out every non-SSO user**. |
+
+`LocalTokenRevoker` is optional. Implement it if your app issues tokens that outlive the session
+row — otherwise the checkpoint detects revocation and changes nothing.
+
+`Provider` is a plain struct, not a schema: each application maps its own storage onto it, which
+is what lets a service with no provider table use this at all. `ClientSecret` is the RESOLVED
+secret, because every service resolves it differently (Keyring reference, AES-GCM column, plain
+env var) and a library owning that would need to know all three.
+
+### The checkpoint: why neither fail-open nor fail-closed
+
+| Introspection says | Result | Reasoning |
+|---|---|---|
+| `active: false` | **Revoked, immediately** | The IdP was reachable, authenticated us, and said the grant is gone. The one unambiguous signal. **No grace.** |
+| No answer, inside grace | **OK** | Fail-closed makes this service less available than the IdP and hands anyone who can disrupt that link a logout button. |
+| No answer, past grace | **Unavailable** | Unbounded fail-open makes revocation unenforceable exactly when it matters. |
+| Non-2xx from introspection | **Not a revocation** | A 401 means *our* credentials are wrong; a 500 means the IdP is broken. Reading either as revocation logs out the platform in response to our own misconfiguration. |
+
+Defaults: `CheckpointInterval` 5 min, `CheckpointGrace` 30 min. The grace clock runs from
+`LastCheckedAt` — the last time an answer was actually obtained — never from now, because
+measuring from now restarts the window on every failed attempt and a permanently unreachable IdP
+would grant permanent access.
+
+⚠️ **`CheckpointUnavailable` maps to HTTP 503, not 401.** A 401 tells clients to discard
+credentials and re-authenticate — against the IdP that is already down. Ten thousand clients
+doing that is a thundering herd arriving when the IdP can least absorb it, and the users are
+logged out for a problem that was never theirs.
+
+### Testing: why the fixture is a server
+
+`sso/ssotest.FakeIDP` speaks the real protocol over `httptest`. A mocked `Adapter` would assert
+that the code calls the functions the code calls — and every defect above was a **missing
+protocol step** a mock has no opinion about. A mock has no token endpoint to notice an absent
+verifier, no id_token to put a wrong nonce in, and no second identity to conflict with the first.
+
+`FakeIDP` injects one specific misbehaviour per field: `OmitIDToken`, `WrongNonce`,
+`WrongAudience`, `WrongIssuer`, `ExpiredIDToken`, `UnsignedIDToken`, `UnknownKID`,
+`UserInfoSubject`, `IgnorePKCE`, `IntrospectActive`, `IntrospectStatus`.
+
+⚠️ **`IgnorePKCE` is the most important one.** It models a real authorization server that does
+not enforce PKCE — the only condition under which a client's dropped verifier goes unnoticed. A
+suite that only ever talks to a strict server cannot distinguish "the client sent the verifier"
+from "the server rejected the client", so it cannot prove the client sends it.
+
+#### The suite is mutation-tested, and that is the acceptance criterion
+
+Assertions that cannot fail are worse than absent ones. Each defence was removed in turn and the
+corresponding test confirmed to fail:
+
+| Mutation | Test that caught it |
+|---|---|
+| `oauth2.VerifierOption` dropped from `Exchange` | `TestPKCE_VerifierIsActuallySent` |
+| nonce comparison deleted | `TestNonce_MismatchIsRejected` |
+| UserInfo `sub` comparison disabled | `TestUserInfo_SubjectMustMatchIDToken` |
+| grace window removed (unbounded fail-open) | `TestCheckpoint_BoundedFailOpen` |
+
+**Re-run that check when you change a defence.** A green suite is necessary and not sufficient;
+the question is whether it would go red.
+
 ## Ecosystem & related repos
 
 | Repo | Relationship |
@@ -356,6 +514,24 @@ accepted `iss`, which no token carries yet.
   requires an exact match; loosening it accepts lookalike issuers.
 - **No tests exist outside `token_test.go`.** If you touch `middleware.go`, say so plainly in
   the handoff; there is no safety net for the cookie/handler/cache paths.
+
+### `sso` package guardrails
+
+- **Do not add a configuration flag that weakens one of the five invariants.** Not "allow plain
+  PKCE", not "skip nonce for provider X", not "merge UserInfo anyway". Each was already missing
+  somewhere and each was a real vulnerability.
+- **Do not key identity on anything reassignable.** `Provider.SubjectClaim` exists for providers
+  with a non-standard *stable* claim name. Pointing it at an email or username is the takeover
+  bug with extra steps.
+- **Do not import a database driver, HTTP framework, or logger into `sso/`.** The seams exist so
+  this stays true, and the root package's leanness is the reason consumers tolerate the module.
+- **Do not weaken `StateStore.ConsumeState`'s atomicity requirement**, or implement it as
+  `SELECT` then `DELETE` in an adopting service.
+- **Do not collapse "no answer" into `active: false`.** Different facts, different correct
+  responses; conflating them is a platform-wide logout.
+- **Do not make `CheckpointUnavailable` a 401.**
+- **`sso/ssotest` is test-only.** It signs with a per-instance key and accepts any client secret.
+  Never import it outside a test binary.
 
 ## Verification — always before "done"
 
