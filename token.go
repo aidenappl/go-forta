@@ -30,9 +30,13 @@ const (
 	// this is what tokens will carry.
 	Issuer = "https://auth.appleby.cloud"
 
-	// jwtIssuer is the historical unexported name for LegacyIssuer, kept so
-	// nothing in this package (or its tests) has to be renamed.
-	jwtIssuer = LegacyIssuer
+	// There was a `jwtIssuer = LegacyIssuer` alias here, kept so nothing in this
+	// package had to be renamed during the migration. Its last reader was the
+	// test helper that minted claims with the legacy issuer; once that helper
+	// moved to Issuer, the alias became dead and golangci-lint's `unused` check
+	// failed the build. Do not reintroduce it — LegacyIssuer is the name, and an
+	// alias for a retired value is two names for something that should be used
+	// deliberately or not at all.
 
 	jwtAccessTokenType = "access"
 )
