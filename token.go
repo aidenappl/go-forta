@@ -108,6 +108,21 @@ var hmacOnlySigningAlgs = []string{"HS512"}
 type FortaClaims struct {
 	Type       string `json:"typ"`
 	PlatformID *int64 `json:"platform_id,omitempty"`
+
+	// ClientID is the RFC 9068 §2.2 `client_id` claim: the OAuth client the
+	// access token was issued to. It is set on ACCESS tokens issued through a
+	// grant, alongside an `aud` of the same value and an `at+jwt` JOSE header.
+	//
+	// ⚠️ EMPTY IS NORMAL AND IS NOT A DOWNGRADE. Forta's first-party session
+	// tokens are minted by a login endpoint rather than by a grant, so there is
+	// no client to name; refresh tokens never carry it either. A resource server
+	// that starts REQUIRING this claim will reject Forta's own session tokens.
+	//
+	// ⚠️ The `typ` field above is the Forta CLAIM meaning "access"/"refresh",
+	// which long predates RFC 9068 and is unrelated to the profile's `at+jwt`
+	// JOSE HEADER. Separate namespaces; neither shadows the other.
+	ClientID string `json:"client_id,omitempty"`
+
 	jwt.RegisteredClaims
 }
 
