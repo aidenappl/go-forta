@@ -451,6 +451,50 @@ credentials and re-authenticate — against the IdP that is already down. Ten th
 doing that is a thundering herd arriving when the IdP can least absorb it, and the users are
 logged out for a problem that was never theirs.
 
+### Provider icons — `icon.go`
+
+An administrator supplies a URL for a provider's logo. `FetchIcon` retrieves it
+**once, at save time**, validates it hard, and returns re-encoded bytes the
+application stores and serves from its own origin.
+
+⚠️ **The login page must never hot-link the administrator's URL.** Doing so leaks
+every unauthenticated visitor's IP, User-Agent and Referer to a third party — on
+the one page you can be certain every user loads — makes your login page depend on
+someone else's uptime and TLS, and lets whoever controls that URL swap the image
+after review.
+
+⚠️ **And the fetch is a server-side request to an attacker-influenced URL. That is
+textbook SSRF.** On a host with a cloud metadata service, an unguarded version of
+this function is a credential-disclosure primitive.
+
+| Guard | Attack it stops |
+|---|---|
+| `https` only | cleartext fetch from inside a trusted network; response modifiable in transit |
+| **Address check at DIAL time** | DNS rebinding — validating the hostname up front and then dialling leaves a window where the second lookup returns `169.254.169.254` |
+| Redirects **refused**, not re-validated | a `302` to a private address defeats a check performed only on the original URL |
+| Sniff the bytes, ignore `Content-Type` | the header is supplied by the same party as the bytes |
+| **SVG rejected outright** | an SVG is a document, not a bitmap — served from your origin with a `<script>` in it, that is **stored XSS on the login page** |
+| `io.LimitReader` on the body | `Content-Length` is attacker-controlled: advertise 1 KB, stream gigabytes |
+| Decode **and re-encode** to PNG | strips EXIF, ICC profiles, appended archives and polyglots *by construction*, not by a filter someone has to keep current |
+
+The address rule is **allow-nothing-private**, not a deny-list of known-bad
+addresses: `169.254.169.254` is covered by the link-local rule rather than being
+named, because a deny-list is only as current as the last person to update it.
+IPv4-mapped IPv6 is unwrapped before checking, so `::ffff:10.0.0.1` cannot slip
+past by encoding.
+
+`ValidateIconBytes` is exported separately so a future upload form uses the
+*identical* validation — a second, subtly different copy for uploads is exactly
+how an SVG eventually gets stored.
+
+**A failed fetch must not block saving the provider.** Record the error, leave the
+icon null, and let the login page fall back to a text button. Surface the error in
+the admin UI so it can be fixed.
+
+**These guards are mutation-tested too.** Each was removed in turn and the
+corresponding test confirmed to fail: the address check, the SVG rejection, the
+re-encode (replaced with a pass-through), and the `https` requirement.
+
 ### Testing: why the fixture is a server
 
 `sso/ssotest.FakeIDP` speaks the real protocol over `httptest`. A mocked `Adapter` would assert
