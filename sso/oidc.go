@@ -91,6 +91,15 @@ func newOIDCAdapter(ctx context.Context, p *Provider) (Adapter, error) {
 	}, nil
 }
 
+// LogoutVerifier exposes the id_token verifier for back-channel logout.
+//
+// It satisfies logoutVerifierSource, the narrow interface BackchannelLogout
+// type-asserts for. Only KindOIDC implements it — an OAuth2 provider has no
+// signed tokens and no JWKS, so there is nothing to verify a logout token
+// against, and back-channel logout is genuinely unavailable there rather than
+// merely unimplemented.
+func (a *oidcAdapter) LogoutVerifier() *oidc.IDTokenVerifier { return a.verifier }
+
 func (a *oidcAdapter) AuthCodeURL(state, nonce, verifier string) (string, error) {
 	if state == "" || nonce == "" || verifier == "" {
 		// All three come from GenerateState. An empty one means the caller

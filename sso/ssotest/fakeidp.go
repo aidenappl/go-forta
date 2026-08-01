@@ -410,3 +410,86 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(body)
 }
+
+// LogoutTokenOptions shapes a minted logout token, including the ways a
+// malicious or broken provider might get it wrong.
+//
+// ⚠️ THE FAILURE-INJECTION FIELDS ARE THE POINT OF THIS TYPE. A receiver that
+// accepts a well-formed logout token proves very little; what matters is that it
+// REFUSES the malformed ones, and each field here corresponds to a specific
+// attack the spec's rules exist to prevent.
+type LogoutTokenOptions struct {
+	Subject string
+	SID     string
+
+	// WithNonce adds a `nonce` claim, which §2.4 FORBIDS. A logout token
+	// carrying one can be replayed into the id_token position and accepted as
+	// proof the user just authenticated — a sign-out turned into a sign-in.
+	// A conforming receiver must reject the token outright.
+	WithNonce string
+
+	// OmitEvents drops the `events` claim, without which a receiver cannot tell
+	// this is a logout token at all.
+	OmitEvents bool
+
+	// WrongAudience addresses the token to a different client — the check that
+	// stops one relying party acting on another's logout notification.
+	WrongAudience string
+
+	// WrongIssuer forges the issuer.
+	WrongIssuer string
+
+	// Expired backdates `exp`.
+	Expired bool
+
+	// Unsigned emits `alg: none`.
+	Unsigned bool
+}
+
+// MintLogoutToken produces a Back-Channel Logout 1.0 §2.4 logout token signed by
+// this IdP.
+func (f *FakeIDP) MintLogoutToken(clientID string, opts LogoutTokenOptions) (string, error) {
+	aud := clientID
+	if opts.WrongAudience != "" {
+		aud = opts.WrongAudience
+	}
+	iss := f.Server.URL
+	if opts.WrongIssuer != "" {
+		iss = opts.WrongIssuer
+	}
+	exp := time.Now().Add(2 * time.Minute)
+	if opts.Expired {
+		exp = time.Now().Add(-2 * time.Minute)
+	}
+
+	claims := jwt.MapClaims{
+		"iss": iss,
+		"aud": aud,
+		"iat": time.Now().Unix(),
+		"exp": exp.Unix(),
+		"jti": fmt.Sprintf("jti-%d-%s", time.Now().UnixNano(), opts.SID),
+	}
+	if opts.Subject != "" {
+		claims["sub"] = opts.Subject
+	}
+	if opts.SID != "" {
+		claims["sid"] = opts.SID
+	}
+	if !opts.OmitEvents {
+		claims["events"] = map[string]any{
+			"http://schemas.openid.net/event/backchannel-logout": map[string]any{},
+		}
+	}
+	if opts.WithNonce != "" {
+		claims["nonce"] = opts.WithNonce
+	}
+
+	if opts.Unsigned {
+		return jwt.NewWithClaims(jwt.SigningMethodNone, claims).
+			SignedString(jwt.UnsafeAllowNoneSignatureType)
+	}
+	tok := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+	tok.Header["kid"] = f.kid
+	tok.Header["typ"] = "logout+jwt"
+	return tok.SignedString(f.key)
+}

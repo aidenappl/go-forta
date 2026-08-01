@@ -118,6 +118,7 @@ itself tells you.
 | `sso/oauth2.go` | The plain-OAuth2 adapter. Strictly weaker; read its type comment before using it. |
 | `sso/introspect.go` | RFC 7662 client. Distinguishes `active:false` from "no answer". |
 | `sso/checkpoint.go` | `Checkpointer`, `CheckpointResult`, the interval and the bounded grace window. |
+| `sso/backchannel.go` | `BackchannelLogout` (the receiver), `BackchannelLogoutTarget` (optional interface), the replay cache. |
 | `sso/ssotest/fakeidp.go` | A protocol-correct fake OIDC provider with per-defect failure injection. **Test-only.** |
 | `sso/ssotest/store.go` | In-memory `StateStore` and `SessionStore` for tests. |
 
@@ -426,6 +427,42 @@ adopting services have three different ones and one has no provider table at all
 
 `LocalTokenRevoker` is optional. Implement it if your app issues tokens that outlive the session
 row — otherwise the checkpoint detects revocation and changes nothing.
+
+### Back-channel logout (`sso/backchannel.go`)
+
+`BackchannelLogout.Handler(slug)` receives OIDC Back-Channel Logout 1.0 notifications. Mount it at
+the URL you register with the provider as `backchannel_logout_uri`.
+
+**⚠️ IT DOES NOT REPLACE THE CHECKPOINT.** Back-channel logout is best-effort *by specification* —
+no delivery guarantee, and a consumer that was down when the notification fired never hears about
+it. The checkpoint stays as the backstop for what delivery missed.
+
+**⚠️ THIS ENDPOINT HAS NO COOKIE AND NO BEARER TOKEN. Its only authentication is the signature on
+the logout token.** Nothing acts on a claim before `VerifyLogout` returns. That is also why a
+plain OAuth2 provider **cannot** support it at all — no signed tokens, no JWKS, nothing to verify
+against — and `Handler` answers 501 for one rather than accepting an unverifiable POST that would
+let anyone who can reach the URL log out any user they can name.
+
+`BackchannelLogoutTarget` is **optional and separate from `SessionStore`**, for the same reason as
+`LocalTokenRevoker`: adding methods to `SessionStore` would break every consumer at once and force
+each to ship a logout receiver before it could take any other update. A store that does not
+implement it gets a 501 and a log line — never a silent 200, which would tell the provider its
+notifications are landing while every one is discarded.
+
+Rules that are not stylistic:
+
+- **`sid` first, `sub` only as a fallback.** A token naming a session means *end that session*.
+  Falling through to the subject signs the user out of every other device over one revoked
+  session.
+- **A duplicate delivery is a 200.** The sender re-sends the identical token when it could not
+  record an acknowledgement; a 4xx makes it retry to exhaustion and report the receiver as broken
+  for a message already applied.
+- **Zero sessions ended is a 200.** The session may have expired or never existed on this node.
+  There is nothing a retry would achieve. Only a genuine failure returns 500, which is the one
+  case where a retry is wanted.
+- **The replay cache is in-memory and per-process**, so a duplicate hitting a different replica is
+  processed twice. Acceptable *here* because ending an already-ended session is idempotent; it
+  exists to avoid pointless work, not to prevent a harmful outcome.
 
 `Provider` is a plain struct, not a schema: each application maps its own storage onto it, which
 is what lets a service with no provider table use this at all. `ClientSecret` is the RESOLVED
