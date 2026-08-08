@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 
@@ -265,5 +266,109 @@ func TestCheckpointResult_String(t *testing.T) {
 		if got := tt.r.String(); got != tt.want {
 			t.Errorf("String() = %q, want %q", got, tt.want)
 		}
+	}
+}
+
+// TestCheckpoint_ConcurrentChecksIssueOneIntrospection pins the stampede fix.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// ⚠️ THE ASSERTION IS THE CALL COUNT, NOT THE RESULT. Every one of these
+// goroutines returned the correct verdict before the fix too — that is precisely
+// why the bug survived: the behaviour was right and the cost was invisible.
+//
+// Check runs per REQUEST. A single page load fires many API calls at once, they
+// all read the same stale LastCheckedAt, and each independently decides a check is
+// due. Production on 2026-08-07: one Monitor page load produced SIX simultaneous
+// introspections of the same token. The multiplier is the concurrency of the
+// busiest page, so nothing in this package bounds it — and it arrives as a burst,
+// the shape most likely to trip a rate limit exactly when a real revocation needs
+// to get through.
+//
+// The delay holds the first call open so the others are genuinely in flight
+// together; without it they would serialise and the test would pass either way.
+// ─────────────────────────────────────────────────────────────────────────────
+func TestCheckpoint_ConcurrentChecksIssueOneIntrospection(t *testing.T) {
+	idp := ssotest.NewFakeIDP(t)
+	idp.IntrospectDelay = 150 * time.Millisecond
+
+	c, _ := newCheckpointer(t, idp, longPast(), nil)
+
+	const callers = 8
+	var wg sync.WaitGroup
+	results := make([]sso.CheckpointResult, callers)
+
+	start := make(chan struct{})
+	for i := range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start // release them together
+			results[i] = c.Check(context.Background(), 1)
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if got := idp.IntrospectCalls(); got != 1 {
+		t.Errorf("%d concurrent checkpoints issued %d introspections, want 1.\n\n"+
+			"Each concurrent request is asking the IDENTICAL question about the IDENTICAL "+
+			"token at the same instant. Answering it %d times multiplies load on the identity "+
+			"provider by the concurrency of whatever page the user opened.", callers, got, got)
+	}
+
+	// The shared answer must still be the RIGHT answer for every caller —
+	// de-duplication must not turn into "the first caller wins and the rest are
+	// guessed at".
+	for i, r := range results {
+		if r != sso.CheckpointOK {
+			t.Errorf("caller %d got %v, want ok — sharing one introspection must give every "+
+				"waiter the real verdict, not a default", i, r)
+		}
+	}
+}
+
+// TestCheckpoint_ConcurrentChecksShareARevocation is the same collapse on the
+// path that matters most.
+//
+// A revocation arriving while several requests are in flight must reach ALL of
+// them. If de-duplication leaked a zero-value CheckpointOK to the waiters, the
+// stampede fix would have quietly converted a revocation into a partial one —
+// worse than the stampede it replaced.
+func TestCheckpoint_ConcurrentChecksShareARevocation(t *testing.T) {
+	idp := ssotest.NewFakeIDP(t)
+	idp.IntrospectActive = false
+	idp.IntrospectDelay = 150 * time.Millisecond
+
+	c, sessions := newCheckpointer(t, idp, longPast(), nil)
+
+	const callers = 6
+	var wg sync.WaitGroup
+	results := make([]sso.CheckpointResult, callers)
+
+	start := make(chan struct{})
+	for i := range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			results[i] = c.Check(context.Background(), 1)
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	for i, r := range results {
+		if r != sso.CheckpointRevoked {
+			t.Errorf("caller %d got %v, want revoked — a revocation that reaches only the "+
+				"caller who happened to win the race leaves the other requests authorized", i, r)
+		}
+	}
+
+	sess, err := sessions.LoadSession(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("LoadSession: %v", err)
+	}
+	if sess != nil {
+		t.Error("the session survived a revocation seen by every concurrent caller")
 	}
 }

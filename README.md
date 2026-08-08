@@ -128,12 +128,39 @@ against the identity provider that is already down.
 Full details — the seams, the checkpoint decision table, and why the test fixture is a real
 server rather than a mock — in [`AGENTS.md`](AGENTS.md).
 
+### Back-channel logout (optional, and the checkpoint is not enough without it)
+
+The checkpoint above re-introspects every 5 minutes, so a revoked grant keeps working for up to
+5 minutes. **OIDC Back-Channel Logout 1.0** closes that window: the provider pushes a signed
+`logout_token` the moment the grant is revoked.
+
+```go
+// 1. Implement the OPTIONAL interface on your existing SessionStore.
+func (s *SessionStore) DeleteSessionsBySID(ctx context.Context, provider, sid string) (int, error)
+func (s *SessionStore) DeleteSessionsBySubject(ctx context.Context, provider, sub string) (int, error)
+
+// 2. Mount the handler and register its URL with the provider.
+bcl := &sso.BackchannelLogout{Sessions: store, Providers: lookup}
+r.Handle("/auth/sso/backchannel-logout", bcl.Handler("forta"))
+```
+
+It is a **separate optional interface** rather than methods on `SessionStore` so adopting it is
+not forced on every consumer at once. A store that does not implement it gets a **501** — said
+plainly, because a silent 200 would tell the provider its notifications are landing while every
+one is discarded.
+
+⚠️ Do not hand-roll the receiver. It is an endpoint with no cookie and no bearer token, whose only
+authentication is the signature, and the rule most implementations miss is that §2.4 **forbids
+`nonce`** — a logout token carrying one can be replayed into the id_token position and accepted as
+a fresh authentication. `sso/backchannel_test.go` asserts refusal of that and five other attacks.
+
 ## Documentation
 
 | Document                                         | Description                                                                                                                                                   |
 | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | [docs/implementation.md](docs/implementation.md) | Complete integration guide — all `Config` options, cookie strategies, bearer tokens, local vs remote validation, and testing patterns.                        |
 | [docs/server.md](docs/server.md)                 | Server-side migration guide for `forta-api` — how shared types (`FortaClaims`, `TokenPair`, `User`, etc.) map from the old structs to `go-forta` equivalents. |
+| [forta-api `docs/onboarding-a-consumer.md`](https://github.com/aidenappl/forta-api/blob/main/docs/onboarding-a-consumer.md) | **What the provider requires of you** — registering a platform, mandatory PKCE, `aud` checking, opaque refresh handles, and the four mechanisms that end a session. Read it before writing an integration; this README covers the SDK, that one covers the contract. |
 
 ---
 

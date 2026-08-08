@@ -38,6 +38,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -102,6 +103,14 @@ type FakeIDP struct {
 	// instead of a JSON body — for testing the "no answer" path distinctly from
 	// active:false.
 	IntrospectStatus int
+
+	// IntrospectDelay, when non-zero, makes the introspection endpoint sleep
+	// before answering. It exists so a test can hold a call OPEN while other
+	// callers arrive — which is the only way to observe whether concurrent
+	// checkpoints collapse into one request or stampede.
+	IntrospectDelay time.Duration
+
+	introspectCalls atomic.Int64
 
 	key   *rsa.PrivateKey
 	kid   string
@@ -379,6 +388,10 @@ func (f *FakeIDP) handleUserInfo(w http.ResponseWriter, r *http.Request) {
 }
 
 func (f *FakeIDP) handleIntrospect(w http.ResponseWriter, r *http.Request) {
+	f.introspectCalls.Add(1)
+	if f.IntrospectDelay > 0 {
+		time.Sleep(f.IntrospectDelay)
+	}
 	if f.IntrospectStatus != 0 {
 		w.WriteHeader(f.IntrospectStatus)
 		_, _ = w.Write([]byte("introspection is unavailable"))
@@ -394,6 +407,13 @@ func (f *FakeIDP) handleIntrospect(w http.ResponseWriter, r *http.Request) {
 		"scope":  "openid email profile",
 	})
 }
+
+// IntrospectCalls reports how many times the introspection endpoint was hit.
+//
+// The COUNT is the assertion in the stampede test: a checkpoint that answers
+// correctly while issuing one upstream request per concurrent HTTP request is
+// still wrong, and the returned CheckpointResult cannot tell you that.
+func (f *FakeIDP) IntrospectCalls() int { return int(f.introspectCalls.Load()) }
 
 // LastTokenRequest returns the most recent form posted to the token endpoint.
 func (f *FakeIDP) LastTokenRequest() url.Values {

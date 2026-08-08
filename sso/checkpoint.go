@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 )
 
@@ -102,6 +103,79 @@ type Checkpointer struct {
 	// log is written on every session and is exactly the kind of high-volume log
 	// that ends up somewhere less protected than the database.
 	Logf func(format string, args ...any)
+
+	// inflight collapses concurrent introspections for the same user.
+	//
+	// ⚠️ A Checkpointer MUST NOT BE COPIED once used — this field carries a mutex.
+	// Every call site holds one by pointer (`&sso.Checkpointer{…}`), which is the
+	// documented usage; `go vet`'s copylocks check enforces the rest.
+	inflight introspectGroup
+}
+
+// introspectGroup de-duplicates in-flight introspections, keyed by user.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// WHY THIS EXISTS: THE CHECKPOINT STAMPEDE.
+//
+// Check runs per REQUEST, and a single page load fires many requests at once. So
+// when the interval lapses, every one of those concurrent requests reads the same
+// stale LastCheckedAt, concludes independently that a check is due, and issues its
+// own introspection. Observed in production on 2026-08-07: one Monitor page load
+// produced SIX simultaneous POST /oauth/introspect calls, each ~250-470ms, all
+// asking the identical question about the identical token.
+//
+// That is not merely wasteful. The multiplier is the concurrency of the busiest
+// page, so the load Forta sees from a checkpoint is unbounded by anything in this
+// package — and it lands in a burst, which is the shape most likely to trip a rate
+// limit precisely when a real revocation needs to get through.
+//
+// The zero value is ready to use; the map is built on first call. That matters
+// because Checkpointer is constructed as a struct literal by every consumer, so
+// anything requiring a constructor here would be a breaking change.
+// ─────────────────────────────────────────────────────────────────────────────
+type introspectGroup struct {
+	mu    sync.Mutex
+	calls map[int64]*introspectCall
+}
+
+type introspectCall struct {
+	done chan struct{}
+	resp *IntrospectResponse
+	err  error
+}
+
+// do runs fn for userID, or waits for and shares the result of a call already in
+// flight for that user. The bool reports whether the result was shared.
+//
+// Sharing is CORRECT here, not merely an optimisation: two concurrent checks of
+// the same token at the same instant must reach the same verdict, and one answer
+// is the only way to guarantee that.
+func (g *introspectGroup) do(userID int64, fn func() (*IntrospectResponse, error)) (*IntrospectResponse, error, bool) {
+	g.mu.Lock()
+	if g.calls == nil {
+		g.calls = make(map[int64]*introspectCall)
+	}
+	if existing, ok := g.calls[userID]; ok {
+		g.mu.Unlock()
+		<-existing.done
+		return existing.resp, existing.err, true
+	}
+	call := &introspectCall{done: make(chan struct{})}
+	g.calls[userID] = call
+	g.mu.Unlock()
+
+	call.resp, call.err = fn()
+
+	// Removed from the map BEFORE the channel closes. A caller arriving in that
+	// window finds no entry and starts its own call — one extra request, never a
+	// wrong answer. The alternative ordering risks handing out a call that is
+	// about to be deleted, which is the same cost with a worse failure mode.
+	g.mu.Lock()
+	delete(g.calls, userID)
+	g.mu.Unlock()
+	close(call.done)
+
+	return call.resp, call.err, false
 }
 
 func (c *Checkpointer) interval() time.Duration {
@@ -198,7 +272,15 @@ func (c *Checkpointer) Check(ctx context.Context, userID int64) CheckpointResult
 		return CheckpointOK
 	}
 
-	resp, err := Introspect(ctx, provider, token, hint)
+	// context.WithoutCancel is deliberate. The call may be SHARED with other
+	// requests, so if it inherited this caller's cancellation, one browser tab
+	// closing mid-flight would fail the check for every request waiting on it —
+	// turning a disconnect into a spurious CheckpointUnavailable for unrelated
+	// traffic. Introspect applies its own introspectTimeout, so detaching from
+	// cancellation does not detach from a deadline.
+	resp, err, _ := c.inflight.do(userID, func() (*IntrospectResponse, error) {
+		return Introspect(context.WithoutCancel(ctx), provider, token, hint)
+	})
 	if err != nil {
 		// NO ANSWER. Not a revocation.
 		c.logf("sso: checkpoint: introspect for user %d via %q failed: %v", userID, sess.Provider, err)

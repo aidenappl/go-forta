@@ -488,6 +488,19 @@ credentials and re-authenticate — against the IdP that is already down. Ten th
 doing that is a thundering herd arriving when the IdP can least absorb it, and the users are
 logged out for a problem that was never theirs.
 
+**Concurrent checks for one user collapse into a single introspection** (`introspectGroup`).
+`Check` runs per *request*, so when the interval lapses every concurrent request on a page reads
+the same stale `LastCheckedAt` and independently decides a check is due. Production, 2026-08-07:
+one Monitor page load produced **six simultaneous** introspections of the same token. The
+multiplier is the concurrency of the busiest page — nothing in this package bounded it — and it
+arrives as a burst, the shape most likely to trip a rate limit exactly when a real revocation
+needs to get through. The shared call uses `context.WithoutCancel`, because a caller
+disconnecting mid-flight must not fail the check for every request waiting on it; `Introspect`
+supplies its own deadline regardless.
+
+⚠️ **A `Checkpointer` must not be copied once used** — it now carries a mutex. Every consumer
+already holds one by pointer; `go vet`'s copylocks check enforces the rest.
+
 ### Provider icons — `icon.go`
 
 An administrator supplies a URL for a provider's logo. `FetchIcon` retrieves it
@@ -559,6 +572,8 @@ corresponding test confirmed to fail:
 | nonce comparison deleted | `TestNonce_MismatchIsRejected` |
 | UserInfo `sub` comparison disabled | `TestUserInfo_SubjectMustMatchIDToken` |
 | grace window removed (unbounded fail-open) | `TestCheckpoint_BoundedFailOpen` |
+| introspection single-flight bypassed | `TestCheckpoint_ConcurrentChecksIssueOneIntrospection` (8 callers → 8 calls) |
+| shared result leaked a default instead of the real verdict | `TestCheckpoint_ConcurrentChecksShareARevocation` |
 
 **Re-run that check when you change a defence.** A green suite is necessary and not sufficient;
 the question is whether it would go red.
@@ -567,7 +582,7 @@ the question is whether it would go red.
 
 | Repo | Relationship |
 |------|--------------|
-| [`forta-api`](https://github.com/aidenappl/forta-api) | The server. **Imports this module** for shared types — changes to `types.go` affect both sides. |
+| [`forta-api`](https://github.com/aidenappl/forta-api) | The server. **Imports this module** for shared types — changes to `types.go` affect both sides. Its [`docs/onboarding-a-consumer.md`](https://github.com/aidenappl/forta-api/blob/main/docs/onboarding-a-consumer.md) is the outward-facing contract this SDK implements: mandatory PKCE, `aud` checking, RS256 only, opaque `frtr_` refresh handles, and the four mechanisms that end a session. **When a requirement there changes, this SDK and that document move together** — a client that satisfies one and not the other is broken in production and green in CI. |
 | [`forta-js`](https://github.com/aidenappl/forta-js) | The Node/React equivalent; keep behaviour conceptually aligned. |
 | `keyring-api` | Consumer. Delegates **all** `/admin` auth to `forta.Protected`; gained API-token support purely by bumping to v1.3.0. |
 | `lattice-api`, `monitor-core` | Consumers via their own SSO wiring. |
