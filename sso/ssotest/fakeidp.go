@@ -85,6 +85,16 @@ type FakeIDP struct {
 	// can drive the OIDC Core §5.3.2 mismatch. Empty means "match the id_token".
 	UserInfoSubject string
 
+	// IDTokenSID, when non-empty, stamps a `sid` on the id_token.
+	IDTokenSID string
+
+	// UserInfoSID, when non-empty, puts a `sid` in the UNSIGNED UserInfo
+	// response. It exists to prove the relying party never reads `sid` from
+	// there: UserInfo is fetched with a bearer token and is not signed, so a
+	// `sid` taken from it would let an unsigned response choose which session a
+	// back-channel logout ends.
+	UserInfoSID string
+
 	// IgnorePKCE makes the token endpoint accept an exchange with no or wrong
 	// code_verifier.
 	//
@@ -353,6 +363,9 @@ func (f *FakeIDP) mintIDToken(nonce, clientID string) (string, error) {
 	if nonce != "" {
 		claims["nonce"] = nonce
 	}
+	if f.IDTokenSID != "" {
+		claims["sid"] = f.IDTokenSID
+	}
 
 	if f.UnsignedIDToken {
 		tok := jwt.NewWithClaims(jwt.SigningMethodNone, claims)
@@ -379,12 +392,16 @@ func (f *FakeIDP) handleUserInfo(w http.ResponseWriter, r *http.Request) {
 		sub = f.UserInfoSubject
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	body := map[string]any{
 		"sub":            sub,
 		"email":          f.Email,
 		"email_verified": f.EmailVerified,
 		"name":           f.Name,
-	})
+	}
+	if f.UserInfoSID != "" {
+		body["sid"] = f.UserInfoSID
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 func (f *FakeIDP) handleIntrospect(w http.ResponseWriter, r *http.Request) {

@@ -162,6 +162,13 @@ func (a *oidcAdapter) Exchange(ctx context.Context, code, verifier, nonce string
 		return nil, nil, fmt.Errorf("sso: oidc identity has no subject")
 	}
 
+	// ⚠️ CAPTURED HERE, BEFORE THE USERINFO MERGE, AND THAT ORDERING IS THE
+	// SECURITY PROPERTY. UserInfo is fetched with a bearer token and is not
+	// signed; reading `sid` after the merge would let an unsigned response name
+	// which session a back-channel logout ends. Only the verified id_token may
+	// supply it.
+	sid := claimString(claims, "", "sid")
+
 	if a.provider.FetchUserInfo {
 		uiClaims, err := a.fetchUserInfo(ctx, oauthToken, subject)
 		if err != nil {
@@ -191,6 +198,7 @@ func (a *oidcAdapter) Exchange(ctx context.Context, code, verifier, nonce string
 	id := &Identity{
 		Provider:      a.provider.Slug,
 		Subject:       subject,
+		SID:           sid,
 		Email:         email,
 		EmailVerified: emailVerified,
 		Name:          claimPtr(claims, "name"),

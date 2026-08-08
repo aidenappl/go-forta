@@ -26,6 +26,26 @@ type Identity struct {
 	Provider string `json:"provider"`
 	Subject  string `json:"subject"`
 
+	// SID is the OIDC session identifier (`sid`) from the id_token, when the
+	// provider issues one.
+	//
+	// ─────────────────────────────────────────────────────────────────────────
+	// ⚠️ STORE IT ON THE SESSION EVEN IF YOU HAVE NOT IMPLEMENTED BACK-CHANNEL
+	// LOGOUT. It is the only handle by which a session-scoped logout can name
+	// this session, and a session persisted without one is unreachable by that
+	// mechanism FOREVER — adding the column later reaches only sessions created
+	// after it.
+	//
+	// It is read from the VERIFIED id_token claim set only, and deliberately
+	// BEFORE any UserInfo merge: UserInfo is fetched with a bearer token and is
+	// not signed, so letting it supply a `sid` would let an unsigned response
+	// name which session to end.
+	//
+	// Empty is normal and is not an error. Plain OAuth2 providers have no
+	// id_token at all, and a conforming OIDC provider need not issue `sid`.
+	// ─────────────────────────────────────────────────────────────────────────
+	SID string `json:"sid,omitempty"`
+
 	Email string `json:"email"`
 
 	// EmailVerified is the IdP's assertion, OR the provider-level

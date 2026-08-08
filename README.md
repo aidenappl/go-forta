@@ -106,7 +106,7 @@ case sso.CheckpointUnavailable: // 503 + Retry-After — NOT 401
 }
 ```
 
-### Five invariants, none configurable
+### Six invariants, none configurable
 
 1. Identity is `(Provider, Subject)` — **never email**.
 2. PKCE S256 is always generated and always sent.
@@ -114,6 +114,9 @@ case sso.CheckpointUnavailable: // 503 + Retry-After — NOT 401
 4. `state` is single-use and server-side.
 5. A UserInfo `sub` that disagrees with the id_token discards the whole response
    (OIDC Core §5.3.2).
+6. `Identity.SID` is read from the **verified id_token only**, before any UserInfo merge.
+   `sid` names which session a back-channel logout ends, so an unsigned source must never
+   supply it.
 
 Each was found missing in an implementation already running in production, where a working login
 revealed nothing. That is the argument for a shared package here.

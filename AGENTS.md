@@ -111,7 +111,7 @@ itself tells you.
 | Path | Role |
 |------|------|
 | `sso/provider.go` | `Provider` (a plain struct, **not** a schema), `Kind`, `Validate()`. The package doc lives here and states the five invariants. |
-| `sso/identity.go` | `Identity`, `TokenSet`, the `Adapter` interface, `NewAdapter`. |
+| `sso/identity.go` | `Identity` (including `SID`, read from the verified id_token only), `TokenSet`, the `Adapter` interface, `NewAdapter`. |
 | `sso/seams.go` | **The three interfaces.** `StateStore`, `UserResolver`, `SessionStore`, plus the optional `LocalTokenRevoker`. Read this first. |
 | `sso/state.go` | `GenerateState`, `GenerateLinkState`, `ConsumeState`, `StateData`. |
 | `sso/oidc.go` | The OIDC adapter, discovery cache, claim readers, shared HTTP client and byte limits. |
@@ -571,6 +571,7 @@ corresponding test confirmed to fail:
 | `oauth2.VerifierOption` dropped from `Exchange` | `TestPKCE_VerifierIsActuallySent` |
 | nonce comparison deleted | `TestNonce_MismatchIsRejected` |
 | UserInfo `sub` comparison disabled | `TestUserInfo_SubjectMustMatchIDToken` |
+| `sid` captured AFTER the UserInfo merge (the naive refactor) | `TestIdentitySID/userinfo_must_not_supply_it` |
 | grace window removed (unbounded fail-open) | `TestCheckpoint_BoundedFailOpen` |
 | introspection single-flight bypassed | `TestCheckpoint_ConcurrentChecksIssueOneIntrospection` (8 callers → 8 calls) |
 | shared result leaked a default instead of the real verdict | `TestCheckpoint_ConcurrentChecksShareARevocation` |

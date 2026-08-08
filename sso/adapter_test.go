@@ -428,3 +428,81 @@ func TestProviderValidation(t *testing.T) {
 		})
 	}
 }
+
+// TestIdentitySID pins where `sid` comes from.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// ⚠️ THE THIRD SUBTEST IS THE ONE THAT MATTERS. `sid` names WHICH SESSION a
+// back-channel logout ends, so whoever controls it controls whose session dies.
+// UserInfo is fetched with a bearer token and is NOT signed — reading `sid` from
+// it would let an unsigned response pick the target. Capturing it before the
+// merge is the property; this test is what stops a later refactor moving the
+// capture below the merge, where everything would still appear to work.
+// ─────────────────────────────────────────────────────────────────────────────
+func TestIdentitySID(t *testing.T) {
+	t.Run("read_from_the_signed_id_token", func(t *testing.T) {
+		idp := ssotest.NewFakeIDP(t)
+		idp.IDTokenSID = "sess-from-id-token"
+		p := newOIDCProvider(t, idp, nil)
+
+		id, _, err := login(t, idp, p)
+		if err != nil {
+			t.Fatalf("login failed: %v", err)
+		}
+		if id.SID != "sess-from-id-token" {
+			t.Errorf("SID = %q, want %q. Without it a session is unreachable by "+
+				"back-channel logout forever — the column cannot be backfilled.", id.SID, "sess-from-id-token")
+		}
+	})
+
+	t.Run("absent_is_normal_not_an_error", func(t *testing.T) {
+		idp := ssotest.NewFakeIDP(t) // no sid stamped
+		p := newOIDCProvider(t, idp, nil)
+
+		id, _, err := login(t, idp, p)
+		if err != nil {
+			t.Fatalf("a provider that issues no sid must still log in: %v", err)
+		}
+		if id.SID != "" {
+			t.Errorf("SID = %q, want empty", id.SID)
+		}
+	})
+
+	t.Run("userinfo_must_not_supply_it", func(t *testing.T) {
+		idp := ssotest.NewFakeIDP(t)
+		idp.UserInfoSID = "sid-from-unsigned-userinfo"
+		p := newOIDCProvider(t, idp, func(p *sso.Provider) {
+			p.FetchUserInfo = true
+			p.UserInfoURL = idp.Issuer() + "/userinfo"
+		})
+
+		id, _, err := login(t, idp, p)
+		if err != nil {
+			t.Fatalf("login failed: %v", err)
+		}
+		if id.SID != "" {
+			t.Fatalf("SID = %q — taken from the UNSIGNED UserInfo response. `sid` selects "+
+				"which session a back-channel logout ends, so accepting one from an unsigned "+
+				"source hands that choice to anything that can answer the UserInfo call. It "+
+				"must be read from the verified id_token, BEFORE the merge.", id.SID)
+		}
+	})
+
+	t.Run("id_token_wins_over_userinfo", func(t *testing.T) {
+		idp := ssotest.NewFakeIDP(t)
+		idp.IDTokenSID = "signed-sid"
+		idp.UserInfoSID = "unsigned-sid"
+		p := newOIDCProvider(t, idp, func(p *sso.Provider) {
+			p.FetchUserInfo = true
+			p.UserInfoURL = idp.Issuer() + "/userinfo"
+		})
+
+		id, _, err := login(t, idp, p)
+		if err != nil {
+			t.Fatalf("login failed: %v", err)
+		}
+		if id.SID != "signed-sid" {
+			t.Errorf("SID = %q, want %q — the signed value must win", id.SID, "signed-sid")
+		}
+	})
+}
