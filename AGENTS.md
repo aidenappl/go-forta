@@ -92,7 +92,7 @@ itself tells you.
 | `main.go` | Package-level `Setup()`, the default client singleton, and the package-level handler wrappers (`LoginHandler`, `Protected`, `GetUserFromContext`, …). |
 | `client.go` | `Client` struct and `newClient()`; `url()`; the outbound calls `exchangeCode`, `getUserInfo` (`GET /auth/self`), `refreshTokens` (`POST /auth/refresh`). |
 | `config.go` | `Config` struct — every knob a consumer can set — plus `validate()` and a secret-redacting `String()`. |
-| `middleware.go` | `Protected`, `resolveAPIToken`, `tryRefresh`, `extractToken`. **The heart of the SDK.** |
+| `middleware.go` | `Protected`, `resolveAPIToken`, `tryRefresh`, `tryRefreshOnMissingToken`, `extractToken`. **The heart of the SDK.** |
 | `context.go` | Unexported context keys and setters (`contextWithFortaID`, `contextWithUser`) with exported getters. |
 | `api_token.go` | `APITokenPrefix`, `IsAPIToken`, and the TTL-bounded `apiTokenCache`. |
 | `grant_cache.go` | `grantCache` — TTL cache for grant-check results. |
@@ -153,6 +153,14 @@ The token tests are deliberately adversarial. In particular:
 | `TestJWKSMaxAge_IndependentOfUnknownKIDRateLimit` | The two refresh triggers are independent: with `JWKSMinRefreshInterval` at 24h the age refresh still fires, and it does **not** reset the rate limit — 25 unknown `kid`s afterwards drive zero extra fetches. |
 | `TestAcceptedIssuers` | Both issuers verify, unrelated/empty/trailing-slash/lookalike issuers are rejected, and an explicit `AcceptedIssuers` list is honoured exactly. |
 
+`middleware_refresh_test.go` covers the no-credential refresh path (v1.10.0):
+
+| Test | What it protects |
+|------|------------------|
+| `TestProtected_RefreshesWhenAccessCookieIsGone` | The regression itself: a request carrying **only** `forta-refresh-token` proceeds, lands the refreshed ID in context, calls `/auth/refresh` exactly once, and writes **both** rotated cookies back. Without the write-back the next request repeats the round-trip. |
+| `TestProtected_NoCredentialAtAll` | A genuinely unauthenticated request is still a plain 401 with no refresh attempt — the fix must not soften real rejection. |
+| `TestProtected_MissingTokenHonoursDisableAutoRefresh` | The new path sits behind the same opt-out as every other refresh, and makes **zero** network calls when disabled. |
+
 Never "fix" a failing test here by relaxing an assertion. Each one encodes an attack.
 
 ## How code is written here
@@ -183,8 +191,39 @@ browsers), falling back to the `forta-access-token` cookie. Then:
 | **`frt_` API token** | Always **remote** — `resolveAPIToken` → `GET /auth/self`, memoized in `apiTokenCache` | Carries no claims, so it *cannot* be validated locally. Never auto-refreshed — long-lived by design. |
 | **Access JWT, `JWTSigningKey` set (or `EnableJWKS`)** | **Local** verify, dispatching on the JWS `alg` header | HS512 → shared `JWTSigningKey`, no network. RS256 → issuer public key by `kid` from the JWKS. On expiry, `tryRefresh` uses the refresh cookie unless `DisableAutoRefresh`. |
 | **Access JWT, no `JWTSigningKey`, `EnableJWKS` false** | **Remote** — `getUserInfo` | Full `User` profile lands in context. Unchanged. |
+| **No credential at all** | `tryRefreshOnMissingToken` → `tryRefresh`, then re-enter the matching row above with the fresh token | Added in v1.10.0. See *Refresh when no credential is presented* below. |
 
 Then optional grant enforcement (`EnforceGrants`), then `contextWithFortaID` / `contextWithUser`.
+
+### Refresh when no credential is presented (v1.10.0)
+
+`setAuthCookies` writes the access cookie with `Expires: tokens.ExpiresAt` — a hard **browser**
+expiry equal to the token's own lifetime — while the refresh cookie gets a 7-day `MaxAge`. The
+moment the access token expires, the browser deletes that cookie from the jar and every
+subsequent request arrives carrying **only** `forta-refresh-token`.
+
+Before v1.10.0, `Protected` saw `extractToken() == ""` and wrote
+`401 missing or invalid authorization` immediately. Auto-refresh was unreachable, because it
+hung off the *expired-JWT* branch (`isTokenExpiredError`) and there was no JWT left to be
+expired. The session was still perfectly refreshable; the caller's only recovery was a manual
+page reload. This was the cause of the intermittent "missing or invalid authorization" wall
+in `keyring-web`.
+
+`Protected` now spends the refresh cookie before giving up. The path honours
+`DisableAutoRefresh` like every other refresh in this middleware, and the 401 string is
+unchanged when refresh is disabled, absent, or rejected — so **the four 401 strings still
+partition the failure modes exactly as documented**:
+
+| String | Meaning |
+|--------|---------|
+| `missing or invalid authorization` | No credential presented **and** no usable refresh cookie |
+| `invalid or expired api token` | Bad `frt_` token |
+| `invalid or expired access token` | JWT invalid for a non-expiry reason, or refresh disabled |
+| `session expired, please log in again` | Token expired **and** refresh failed or was absent |
+
+Covered by `middleware_refresh_test.go`. Note the refreshed token is re-validated by the normal
+branch below — one extra local verify (or one `/auth/self` call on the remote branch). That is
+deliberate: it keeps a single validation path rather than a second, subtly different one.
 
 **API-token support (v1.3.0) is checked first, before the `JWTSigningKey` branch.** This matters:
 services like `keyring-api` set `JWTSigningKey` and therefore take the local path for JWTs, but

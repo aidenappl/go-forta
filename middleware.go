@@ -29,17 +29,38 @@ import (
 // middleware additionally calls /auth/self so that the full User profile
 // is placed in the context.
 //
-// Auto-refresh: if the access token is expired (and DisableAutoRefresh is false)
-// the middleware attempts to refresh using the forta-refresh-token cookie. On
-// success, new cookies are written to the response and the request proceeds.
+// Auto-refresh: if the access token is expired or absent entirely (and
+// DisableAutoRefresh is false) the middleware attempts to refresh using the
+// forta-refresh-token cookie. On success, new cookies are written to the
+// response and the request proceeds.
 // API tokens are never refreshed — they are long-lived by design.
 func (c *Client) Protected(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		tokenStr := extractToken(r)
 
 		if tokenStr == "" {
-			writeJSONError(w, http.StatusUnauthorized, "missing or invalid authorization")
-			return
+			// No credential at all. This is the common case for a browser
+			// session rather than an error: setAuthCookies gives the access
+			// cookie a hard Expires equal to the token's own lifetime, so the
+			// browser drops it from the jar the moment the token expires —
+			// while the refresh cookie lives on for seven days. Falling
+			// straight through to 401 here strands a session that is still
+			// perfectly refreshable, and the caller only recovers by reloading
+			// the page. Spend the refresh cookie before giving up.
+			refreshedID, newToken, refreshErr := c.tryRefreshOnMissingToken(w, r)
+			if refreshedID == 0 || newToken == "" {
+				if refreshErr != nil {
+					log.Printf("go-forta: auto-refresh failed: %v", refreshErr)
+				}
+				writeJSONError(w, http.StatusUnauthorized, "missing or invalid authorization")
+				return
+			}
+			// Continue with the fresh token; it is re-validated below on
+			// whichever branch this client is configured for.
+			tokenStr = newToken
+			if c.grants != nil {
+				c.grants.invalidate(refreshedID)
+			}
 		}
 
 		var userID int64
@@ -152,6 +173,17 @@ func (c *Client) Protected(next http.HandlerFunc) http.HandlerFunc {
 		}
 		next.ServeHTTP(w, r.WithContext(ctx))
 	}
+}
+
+// tryRefreshOnMissingToken is tryRefresh guarded by DisableAutoRefresh, for the
+// path where no credential was presented at all. It is kept separate from
+// tryRefresh because the expired-token callers check DisableAutoRefresh
+// themselves before deciding which error string to write.
+func (c *Client) tryRefreshOnMissingToken(w http.ResponseWriter, r *http.Request) (int64, string, error) {
+	if c.cfg.DisableAutoRefresh {
+		return 0, "", nil
+	}
+	return c.tryRefresh(w, r)
 }
 
 // tryRefresh reads the forta-refresh-token cookie, calls /auth/refresh, and on
