@@ -58,6 +58,10 @@ Three audiences:
   `VerifierOption`). `go-jose/go-jose/v4` arrives indirectly through `go-oidc`.
 - `sso/ssotest`: `golang-jwt/jwt/v5` only, and **test-only**.
 - No router, no SQL, no HTTP framework, no logger. Handlers are plain `http.HandlerFunc`.
+- **No observability dependency either.** Request correlation (v1.11.0) is done by
+  `internal/correlate`, stdlib only — ids travel as plain strings and hosts plug in their own
+  source through a `func(ctx) (requestID, traceID string)` hook. **Do not add `go-monitor`** (or any
+  logger/tracing SDK) to `go.mod`; every token-only consumer would inherit it.
 
 ### What folding `sso` in actually costs — measured, not assumed
 
@@ -103,6 +107,9 @@ itself tells you.
 | `token_test.go` | The test suite. Mostly security regression tests; read the comments before changing an assertion. |
 | `types.go` | Shared wire types + the `fortaEnvelope[T]` generic response wrapper. |
 | `errors.go` | Error helpers, `writeJSONError`, `writeGrantDenied`. |
+| `observe.go` | v1.11.0 observability: `Version`, `WithCorrelation`, `AuthFailure` + `Reason*` constants, `UpstreamError`, and the private `c.do` (every outbound call), `c.logf`, `c.fail`/`c.failGrant` (report to `OnAuthFailure`, then write the error). |
+| `internal/correlate/` | Stdlib-only correlation core shared by both packages: the ctx key, `With`/`From`, `Apply` (header stamping), `FromInbound` (response/request header fallback), the correlating `Transport`, and the `Version` constant the User-Agent is built from. |
+| `middleware_refresh_test.go`, `observability_test.go` | Protected-path tests: the no-credential refresh, outbound correlation on every call, and `OnAuthFailure` reasons with a byte-for-byte response comparison against a hook-less client. |
 | `docs/implementation.md` | Full integration guide for consumers. |
 | `docs/server.md` | Type-mapping guide for `forta-api`. |
 
@@ -118,6 +125,7 @@ itself tells you.
 | `sso/oauth2.go` | The plain-OAuth2 adapter. Strictly weaker; read its type comment before using it. |
 | `sso/introspect.go` | RFC 7662 client. Distinguishes `active:false` from "no answer". |
 | `sso/checkpoint.go` | `Checkpointer`, `CheckpointResult`, the interval and the bounded grace window. |
+| `sso/correlate.go` | `sso.WithCorrelation`, `applyCorrelation` (Introspect, OAuth2 userinfo) and `withCorrelatingClient` (the `oauth2.HTTPClient` wrapper used for the token exchange and OIDC UserInfo). |
 | `sso/backchannel.go` | `BackchannelLogout` (the receiver), `BackchannelLogoutTarget` (optional interface), the replay cache. |
 | `sso/ssotest/fakeidp.go` | A protocol-correct fake OIDC provider with per-defect failure injection. **Test-only.** |
 | `sso/ssotest/store.go` | In-memory `StateStore` and `SessionStore` for tests. |
@@ -132,9 +140,9 @@ dev fmt      # gofmt -w -s .
 dev tidy     # go mod tidy
 ```
 
-**`token_test.go` is the only test file, and it exists to protect the JWT verification path.**
-Everything else in this repo (cookies, handlers, caches) is still untested — verification there
-is still "it compiles, it vets, consumers exercise it in production". Treat any behavioural
+**`token_test.go` protects the JWT verification path.** `middleware_refresh_test.go` and
+`observability_test.go` cover parts of `Protected`/`CallbackHandler`; cookies, the grant cache and
+most handler branches are still only exercised by consumers in production. Treat any behavioural
 change outside `token.go`/`jwks.go` as higher-risk than the line count suggests.
 
 The token tests are deliberately adversarial. In particular:
@@ -380,6 +388,75 @@ known service, `typ: access` is hardcoded, and the `iss` allowlist is a fixed tw
 (overridable, but not discovered). If you need generic OIDC, use a generic library; do not grow
 this one into one.
 
+### Observability — correlation and failure reasons (v1.11.0)
+
+Everything here is **opt-in and additive**. A `Config`/`Checkpointer` with none of the new fields
+set sends the same requests (plus a `User-Agent: go-forta/<Version>` header) and writes the same
+responses as v1.10.0. `observability_test.go` runs every failure case twice — with and without the
+hook — and fails if the status, body or number of refresh calls differ.
+
+**Outbound correlation.** Every root-package call goes through `c.do(req)` (and the JWKS fetch
+through `jwksCache.prepare`), which resolves ids — `Config.Correlation(ctx)` first, then
+`correlate.From(ctx)` — and stamps `X-Request-ID`, `X-Trace-ID`, `traceparent` (only when the
+trace id is a UUID or 32 hex; a fresh random parent id, sampled) and the User-Agent. **A header
+the caller already set is never overwritten, and an id that fails go-monitor's regex (UUID or
+8-64 hex, copied verbatim) is never forwarded** — inbound `X-Request-ID` is attacker-supplied.
+
+`Protected` and `CallbackHandler` stash ids on the context when it has none (`withInboundCorrelation`):
+first the `X-Request-ID`/`X-Trace-ID` **response** headers (host `RequestIDMiddleware`s set these
+before calling `next` — that is the id the host logs), then the inbound `X-Request-ID`,
+`traceparent`, `X-Trace-ID`. `next` therefore receives a context carrying the correlate value; the
+key is unexported, so this cannot collide with anything.
+
+In `sso`, `Introspect` and the OAuth2 userinfo call apply the ctx ids directly; the x/oauth2
+exchange and go-oidc UserInfo go through `withCorrelatingClient`, which puts an
+`oauth2.HTTPClient` wrapping the caller's (or `http.DefaultClient`'s) transport **only when ids are
+present** — so an uncorrelated caller keeps the exact client it had. `correlate.Transport` reads
+ids per request, never captures them, so it cannot leak one user's ids into a cached client.
+**`FetchIcon` never forwards ids** — its target is an administrator-supplied third-party host.
+
+`Checkpointer.Check` resolves `Checkpointer.Correlation` into ctx before `inflight.do`.
+`context.WithoutCancel` keeps values, so the shared introspection carries **the first caller's
+ids**; waiters sharing it do not appear under their own ids at the IdP. Consumers must pass the
+request ctx into `Check` — every current consumer passes `context.Background()`.
+
+**Failure reasons.** Every `writeJSONError`/`writeGrantDenied` in `middleware.go`/`handlers.go`
+is preceded by `c.fail`/`c.failGrant`/`c.reportFailure`, which fires `Config.OnAuthFailure`:
+
+| Path | Response (unchanged) | Reason |
+|------|---------------------|--------|
+| No credential, no refresh cookie | 401 `missing or invalid authorization` | `missing_credential` |
+| No credential, refresh rejected / Forta down | same | `refresh_failed` / `upstream_unavailable` |
+| `frt_` token rejected / Forta down | 401 `invalid or expired api token` | `api_token_invalid` / `upstream_unavailable` |
+| Local JWT invalid (sig, iss, kid, malformed) | 401 `invalid or expired access token` | `token_invalid` (`upstream_unavailable` if the JWKS fetch failed at transport/5xx) |
+| Local JWT expired, refresh disabled or no refresh cookie | 401 `invalid or expired access token` / `session expired…` | `token_expired` |
+| Local JWT expired, refresh rejected / Forta down | 401 `session expired, please log in again` | `refresh_failed` / `upstream_unavailable` |
+| Remote `/auth/self` 401, no refresh cookie / refresh rejected | 401 `session expired…` | `token_expired` / `refresh_failed` |
+| Remote `/auth/self` transport error or 5xx/429 | 401 `session expired…` (refresh **still attempted**) or `invalid or expired access token` when refresh disabled | `upstream_unavailable` |
+| Grant check says 403 | 403 4003 | `grant_denied` |
+| Grant check transport error / unexpected status | 403 4003 (fail-closed, unchanged) | `grant_check_failed` |
+| Code exchange fails | 401 `failed to exchange authorization code` | `exchange_failed` |
+| Callback: auth-server error, missing code/state, state cookie missing/mismatch; Login: bad Host | 400 | `callback_invalid` |
+| State generation fails | 500 | `internal_error` |
+
+⚠️ The remote-path refresh during a Forta outage (`/auth/self` 5xx → `/auth/refresh`) is
+**deliberately left as it was**. It rotates tokens against a degraded Forta, which is questionable,
+but changing it is a behaviour change and belongs in its own release with its own decision.
+
+"Unavailable" is `isUpstreamUnavailable`: a `*url.Error` (every `http.Client.Do` failure) or an
+`*UpstreamError` with status ≥500 or 429. Non-2xx Forta responses are now `*UpstreamError{Op,
+Status, RequestID}` whose `Error()` text is **identical** to the old `fmt.Errorf` strings, so log
+lines did not change; `RequestID` is forta-api's echoed `X-Request-ID` and becomes
+`AuthFailure.UpstreamRequestID`.
+
+**Logging.** All root-package lines go through `Config.Logf` (default `log.Printf`). Newly logged
+(previously swallowed): API-token rejection, local non-expiry JWT rejection, `/auth/self`
+unavailability on the remote path, the post-refresh `/auth/self` failure, and exchange failure —
+one line each, with ` request_id=… trace_id=…` appended, never a token. A plain remote 401 is
+**not** logged: it is the normal expiry path and is followed by a refresh.
+`Checkpointer.LogfCtx` (preferred over `Logf`) gets the Check ctx; `Checkpointer.OnResult` fires
+once per Check that got past the cheap early returns, with the error that shaped the result.
+
 ### Cache TTLs and revocation latency
 
 | Cache | Config | Default | What the TTL bounds |
@@ -399,6 +476,17 @@ Tagged releases consumed via the Go module proxy, which caches immutably.
 **`v1.2.0` was already published, pointing at a commit predating API-token support.** Because
 proxy entries cannot be rewritten, that feature shipped as **v1.3.0**. Never retag a published
 version — cut a new one.
+
+**Release notes — v1.11.0 (request correlation + failure observability).** Minor bump, purely
+additive. New exported surface: `Version`, `WithCorrelation`, `AuthFailure`, `UpstreamError`, the
+`Reason*` constants, `Config.Correlation`, `Config.OnAuthFailure`, `Config.Logf`,
+`Config.HTTPClient`; in `sso`: `WithCorrelation`, `Checkpointer.Correlation`,
+`Checkpointer.LogfCtx`, `Checkpointer.OnResult`. No signature, interface or struct-literal
+compatibility changed; zero values keep v1.10.0 behaviour except that outbound requests now carry
+`User-Agent: go-forta/1.11.0` and a handful of previously swallowed errors are logged. Non-2xx
+Forta errors are `*UpstreamError` with unchanged `Error()` text. `config.go`'s comments no longer
+claim `/oauth/userinfo` is called — it is `/auth/self`. No new module dependency.
+⚠️ `internal/correlate.Version` is the User-Agent version: bump it in the same commit as the tag.
 
 **RS256/JWKS support plus dual-issuer acceptance is a minor bump — `v1.4.0`.** It adds exported
 surface (`Config.JWKSURL`, `Config.JWKSMinRefreshInterval`, `Config.JWKSMaxAge`,
@@ -666,7 +754,7 @@ the question is whether it would go red.
   withdrawn key another full max age.
 - **Do not "normalise" the `iss` comparison** (trailing slash, case, scheme). OIDC Core §3.1.3.7
   requires an exact match; loosening it accepts lookalike issuers.
-- **No tests exist outside `token_test.go`.** If you touch `middleware.go`, say so plainly in
+- **Test coverage outside `token_test.go` is partial** (see *Running, building & testing*). If you touch `middleware.go`, say so plainly in
   the handoff; there is no safety net for the cookie/handler/cache paths.
 
 ### `sso` package guardrails
@@ -726,5 +814,10 @@ Update this AGENTS.md in the same change when you:
   incident discussions.
 - **Change anything in `types.go`** → note the `forta-api` co-change requirement.
 - **Cut a release** → record the version and what changed, including any tag-numbering
-  irregularity (as with the v1.2.0/v1.3.0 skip).
+  irregularity (as with the v1.2.0/v1.3.0 skip), and bump `internal/correlate.Version` (the
+  `go-forta/<Version>` User-Agent) to match the tag.
+- **Add an outbound HTTP call** → route it through `c.do` (root) or `applyCorrelation` /
+  `withCorrelatingClient` (`sso`), unless its target is a third party (then never).
+- **Add an error response in `Protected` or a handler** → report it through `c.fail`/`c.failGrant`
+  with a `Reason*` constant, and add the row to the *Observability* table.
 - Also keep `README.md` and `docs/implementation.md` in sync — they are what consumers read.

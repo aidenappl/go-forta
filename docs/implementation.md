@@ -147,8 +147,32 @@ forta.Config{
     // "https://auth.appleby.cloud" (the OIDC discovery issuer, the target).
     // A non-empty list is used exactly as given — no defaults are merged in.
     AcceptedIssuers: nil,
+
+    // --- Observability (v1.11.0+, all optional; nil = previous behaviour) ---
+
+    // Returns the request/trace id forwarded to Forta on every outbound call
+    // (X-Request-ID, X-Trace-ID, traceparent). Falls back to ids on the ctx
+    // (forta.WithCorrelation), then to the X-Request-ID/X-Trace-ID response
+    // headers your request-id middleware set, then to the inbound request headers.
+    Correlation: func(ctx context.Context) (string, string) {
+        return monitor.RequestID(ctx), monitor.TraceID(ctx)
+    },
+
+    // Called just before an error response is written, with a structured reason
+    // (forta.Reason*), the status, the underlying error and forta-api's echoed
+    // X-Request-ID. Never changes the response.
+    OnAuthFailure: func(r *http.Request, f forta.AuthFailure) { /* log / metric */ },
+
+    // Receives the SDK's log lines. Default: log.Printf.
+    Logf: log.Printf,
+
+    // Client for Forta API + JWKS calls. Default: 10s-timeout client (JWKS: 5s).
+    HTTPClient: nil,
 }
 ```
+
+See the README section *Observability* for the full reason table and the `sso.Checkpointer`
+equivalents (`Correlation`, `LogfCtx`, `OnResult`).
 
 ---
 
@@ -459,3 +483,8 @@ HTTP status codes:
 | `400 Bad Request`           | Missing `code`/`state`, CSRF mismatch, or auth server error                    |
 | `401 Unauthorized`          | Missing token, invalid token, expired (when auto-refresh is disabled or fails) |
 | `500 Internal Server Error` | `Setup` not called before a handler is invoked                                 |
+
+The response body and status never tell a client *why* a 401 happened — by design. The host
+learns it through `Config.OnAuthFailure` (v1.11.0), whose `Reason` separates a bad credential from
+an unreachable Forta (`ReasonUpstreamUnavailable`) and a real grant denial from a failed grant check
+(`ReasonGrantCheckFailed`), all of which otherwise produce identical responses.
