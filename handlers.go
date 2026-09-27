@@ -4,8 +4,8 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
+	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -25,7 +25,7 @@ func (c *Client) LoginHandler(w http.ResponseWriter, r *http.Request) {
 	if c.cfg.CookieDomain == ".appleby.cloud" {
 		// Validate Host header when constructing origin from request.
 		if c.cfg.CookieDomain != "" && !strings.HasSuffix(r.Host, c.cfg.CookieDomain) {
-			writeJSONError(w, http.StatusBadRequest, "invalid host")
+			c.fail(w, r, http.StatusBadRequest, "invalid host", ReasonCallbackInvalid, errors.New("go-forta: login: request host does not match CookieDomain"))
 			return
 		}
 
@@ -51,7 +51,7 @@ func (c *Client) LoginHandler(w http.ResponseWriter, r *http.Request) {
 
 	state, err := generateState()
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "failed to generate state token")
+		c.fail(w, r, http.StatusInternalServerError, "failed to generate state token", ReasonInternalError, err)
 		return
 	}
 
@@ -80,10 +80,13 @@ func (c *Client) LoginHandler(w http.ResponseWriter, r *http.Request) {
 //
 //	mux.HandleFunc("/forta/callback", forta.CallbackHandler)
 func (c *Client) CallbackHandler(w http.ResponseWriter, r *http.Request) {
+	r = withInboundCorrelation(w, r)
+
 	// Check for an error from the authorization server.
 	if errParam := r.URL.Query().Get("error"); errParam != "" {
 		errDesc := r.URL.Query().Get("error_description")
-		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("authorization error: %s: %s", errParam, errDesc))
+		msg := fmt.Sprintf("authorization error: %s: %s", errParam, errDesc)
+		c.fail(w, r, http.StatusBadRequest, msg, ReasonCallbackInvalid, errors.New("go-forta: callback: "+msg))
 		return
 	}
 
@@ -91,18 +94,18 @@ func (c *Client) CallbackHandler(w http.ResponseWriter, r *http.Request) {
 	state := r.URL.Query().Get("state")
 
 	if code == "" || state == "" {
-		writeJSONError(w, http.StatusBadRequest, "missing code or state parameter")
+		c.fail(w, r, http.StatusBadRequest, "missing code or state parameter", ReasonCallbackInvalid, errors.New("go-forta: callback: missing code or state parameter"))
 		return
 	}
 
 	// Validate CSRF state.
 	stateCookie, err := r.Cookie(cookieOAuthState)
 	if err != nil || stateCookie.Value == "" {
-		writeJSONError(w, http.StatusBadRequest, "missing state cookie — possible CSRF or expired session")
+		c.fail(w, r, http.StatusBadRequest, "missing state cookie — possible CSRF or expired session", ReasonCallbackInvalid, errors.New("go-forta: callback: missing state cookie"))
 		return
 	}
 	if subtle.ConstantTimeCompare([]byte(stateCookie.Value), []byte(state)) != 1 {
-		writeJSONError(w, http.StatusBadRequest, "state mismatch — possible CSRF attack")
+		c.fail(w, r, http.StatusBadRequest, "state mismatch — possible CSRF attack", ReasonCallbackInvalid, errors.New("go-forta: callback: state mismatch"))
 		return
 	}
 	c.clearStateCookie(w)
@@ -110,7 +113,8 @@ func (c *Client) CallbackHandler(w http.ResponseWriter, r *http.Request) {
 	// Exchange code for token pair.
 	authResp, err := c.exchangeCode(r.Context(), code)
 	if err != nil {
-		writeJSONError(w, http.StatusUnauthorized, "failed to exchange authorization code")
+		c.logf("go-forta: code exchange failed: %v%s", err, c.requestSuffix(r))
+		c.fail(w, r, http.StatusUnauthorized, "failed to exchange authorization code", ReasonExchangeFailed, err)
 		return
 	}
 
@@ -119,12 +123,12 @@ func (c *Client) CallbackHandler(w http.ResponseWriter, r *http.Request) {
 	if c.cfg.EnforceGrants && c.grants != nil {
 		granted, grantErr := c.checkGrant(r.Context(), authResp.Authorization.AccessToken)
 		if grantErr != nil {
-			log.Printf("go-forta: grant check at login failed: %v", grantErr)
-			writeGrantDenied(w)
+			c.logf("go-forta: grant check at login failed: %v", grantErr)
+			c.failGrant(w, r, ReasonGrantCheckFailed, grantErr)
 			return
 		}
 		if !granted {
-			writeGrantDenied(w)
+			c.failGrant(w, r, ReasonGrantDenied, nil)
 			return
 		}
 		c.grants.set(authResp.User.ID, granted)

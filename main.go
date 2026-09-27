@@ -175,5 +175,5 @@ func FetchCurrentUser(r *http.Request) (*User, error) {
 	if token == "" {
 		return nil, errors.New("go-forta: no access token found in request")
 	}
-	return c.getUserInfo(r.Context(), token)
+	return c.getUserInfo(withInboundCorrelation(nil, r).Context(), token)
 }

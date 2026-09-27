@@ -2,7 +2,7 @@ package forta
 
 import (
 	"context"
-	"log"
+	"errors"
 	"net/http"
 	"strings"
 )
@@ -36,6 +36,11 @@ import (
 // API tokens are never refreshed — they are long-lived by design.
 func (c *Client) Protected(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Stash correlation ids (host response header, then inbound request
+		// headers) on the context when it does not already carry them, so every
+		// outbound call below is joinable to this request in forta-api's logs.
+		r = withInboundCorrelation(w, r)
+
 		tokenStr := extractToken(r)
 
 		if tokenStr == "" {
@@ -49,10 +54,12 @@ func (c *Client) Protected(next http.HandlerFunc) http.HandlerFunc {
 			// the page. Spend the refresh cookie before giving up.
 			refreshedID, newToken, refreshErr := c.tryRefreshOnMissingToken(w, r)
 			if refreshedID == 0 || newToken == "" {
+				reason := ReasonMissingCredential
 				if refreshErr != nil {
-					log.Printf("go-forta: auto-refresh failed: %v", refreshErr)
+					c.logf("go-forta: auto-refresh failed: %v", refreshErr)
+					reason = refreshFailureReason(refreshErr)
 				}
-				writeJSONError(w, http.StatusUnauthorized, "missing or invalid authorization")
+				c.fail(w, r, http.StatusUnauthorized, "missing or invalid authorization", reason, refreshErr)
 				return
 			}
 			// Continue with the fresh token; it is re-validated below on
@@ -70,7 +77,12 @@ func (c *Client) Protected(next http.HandlerFunc) http.HandlerFunc {
 			// ── Opaque API token: always resolved remotely ───────────────────
 			u, err := c.resolveAPIToken(r.Context(), tokenStr)
 			if err != nil {
-				writeJSONError(w, http.StatusUnauthorized, "invalid or expired api token")
+				reason := ReasonAPITokenInvalid
+				if isUpstreamUnavailable(err) {
+					reason = ReasonUpstreamUnavailable
+				}
+				c.logf("go-forta: api token rejected (%s): %v%s", reason, err, c.requestSuffix(r))
+				c.fail(w, r, http.StatusUnauthorized, "invalid or expired api token", reason, err)
 				return
 			}
 			userID = u.ID
@@ -79,17 +91,33 @@ func (c *Client) Protected(next http.HandlerFunc) http.HandlerFunc {
 			// ── Local JWT validation ─────────────────────────────────────────
 			id, err := c.validateAccessToken(r.Context(), tokenStr)
 			if err != nil {
-				if !isTokenExpiredError(err) || c.cfg.DisableAutoRefresh {
-					writeJSONError(w, http.StatusUnauthorized, "invalid or expired access token")
+				expired := isTokenExpiredError(err)
+				if !expired || c.cfg.DisableAutoRefresh {
+					reason := ReasonTokenExpired
+					if !expired {
+						reason = ReasonTokenInvalid
+						if isUpstreamUnavailable(err) {
+							// The JWKS could not be fetched, so the token was
+							// never actually judged.
+							reason = ReasonUpstreamUnavailable
+						}
+						c.logf("go-forta: access token rejected (%s): %v%s", reason, err, c.requestSuffix(r))
+					}
+					c.fail(w, r, http.StatusUnauthorized, "invalid or expired access token", reason, err)
 					return
 				}
 
 				// Access token is expired — try to refresh transparently.
 				refreshedID, newToken, refreshErr := c.tryRefresh(w, r)
 				if refreshedID == 0 {
+					reason, failErr := ReasonTokenExpired, error(errNoRefreshCookie)
+					if refreshErr != nil {
+						reason, failErr = refreshFailureReason(refreshErr), refreshErr
+					}
+					c.reportFailure(r, reason, http.StatusUnauthorized, failErr)
 					writeJSONError(w, http.StatusUnauthorized, "session expired, please log in again")
 					if refreshErr != nil {
-						log.Printf("go-forta: auto-refresh failed: %v", refreshErr)
+						c.logf("go-forta: auto-refresh failed: %v", refreshErr)
 					}
 					return
 				}
@@ -106,7 +134,7 @@ func (c *Client) Protected(next http.HandlerFunc) http.HandlerFunc {
 			if c.cfg.FetchUserOnProtect {
 				u, fetchErr := c.getUserInfo(r.Context(), tokenStr)
 				if fetchErr != nil {
-					log.Printf("go-forta: FetchUserOnProtect: getUserInfo: %v", fetchErr)
+					c.logf("go-forta: FetchUserOnProtect: getUserInfo: %v", fetchErr)
 					// Non-fatal: the user ID is valid, continue without full profile.
 				} else {
 					user = u
@@ -116,16 +144,41 @@ func (c *Client) Protected(next http.HandlerFunc) http.HandlerFunc {
 			// ── Remote validation via /auth/self ─────────────────────────────
 			u, err := c.getUserInfo(r.Context(), tokenStr)
 			if err != nil {
+				// A transport failure or 5xx here means Forta never judged the
+				// token. The response and the refresh attempt below are
+				// deliberately unchanged from previous releases; only the
+				// REPORTED reason distinguishes the outage.
+				upstreamDown := isUpstreamUnavailable(err)
+				if upstreamDown {
+					// Logged only for the outage case: a plain 401 here is the
+					// normal expiry path and is followed by a refresh.
+					c.logf("go-forta: auth/self unavailable, treating as expired: %v%s", err, c.requestSuffix(r))
+				}
 				if c.cfg.DisableAutoRefresh {
-					writeJSONError(w, http.StatusUnauthorized, "invalid or expired access token")
+					reason := ReasonTokenInvalid
+					if upstreamDown {
+						reason = ReasonUpstreamUnavailable
+					}
+					c.fail(w, r, http.StatusUnauthorized, "invalid or expired access token", reason, err)
 					return
 				}
 				// Try to refresh using the refresh token cookie.
 				refreshedID, newToken, refreshErr := c.tryRefresh(w, r)
 				if refreshedID == 0 {
+					reason, failErr := ReasonTokenExpired, err
+					switch {
+					case upstreamDown:
+						reason = ReasonUpstreamUnavailable
+						if refreshErr != nil {
+							failErr = errors.Join(err, refreshErr)
+						}
+					case refreshErr != nil:
+						reason, failErr = refreshFailureReason(refreshErr), refreshErr
+					}
+					c.reportFailure(r, reason, http.StatusUnauthorized, failErr)
 					writeJSONError(w, http.StatusUnauthorized, "session expired, please log in again")
 					if refreshErr != nil {
-						log.Printf("go-forta: auto-refresh failed: %v", refreshErr)
+						c.logf("go-forta: auto-refresh failed: %v", refreshErr)
 					}
 					return
 				}
@@ -140,6 +193,8 @@ func (c *Client) Protected(next http.HandlerFunc) http.HandlerFunc {
 					if nu, uiErr := c.getUserInfo(r.Context(), newToken); uiErr == nil {
 						user = nu
 						userID = nu.ID
+					} else {
+						c.logf("go-forta: auth/self after refresh failed, continuing without profile: %v%s", uiErr, c.requestSuffix(r))
 					}
 				}
 			} else {
@@ -155,14 +210,14 @@ func (c *Client) Protected(next http.HandlerFunc) http.HandlerFunc {
 				var grantErr error
 				granted, grantErr = c.checkGrant(r.Context(), tokenStr)
 				if grantErr != nil {
-					log.Printf("go-forta: grant check failed: %v (denying request)", grantErr)
-					writeGrantDenied(w)
+					c.logf("go-forta: grant check failed: %v (denying request)", grantErr)
+					c.failGrant(w, r, ReasonGrantCheckFailed, grantErr)
 					return
 				}
 				c.grants.set(userID, granted)
 			}
 			if !granted {
-				writeGrantDenied(w)
+				c.failGrant(w, r, ReasonGrantDenied, nil)
 				return
 			}
 		}
@@ -173,6 +228,16 @@ func (c *Client) Protected(next http.HandlerFunc) http.HandlerFunc {
 		}
 		next.ServeHTTP(w, r.WithContext(ctx))
 	}
+}
+
+// refreshFailureReason classifies an error from tryRefresh: an unreachable or
+// failing Forta is ReasonUpstreamUnavailable, anything else (a rejected refresh
+// token, a malformed response) is ReasonRefreshFailed.
+func refreshFailureReason(err error) string {
+	if isUpstreamUnavailable(err) {
+		return ReasonUpstreamUnavailable
+	}
+	return ReasonRefreshFailed
 }
 
 // tryRefreshOnMissingToken is tryRefresh guarded by DisableAutoRefresh, for the

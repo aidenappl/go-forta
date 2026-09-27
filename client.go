@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -37,13 +36,23 @@ func newClient(cfg Config) (*Client, error) {
 	if apiTokenTTL <= 0 {
 		apiTokenTTL = DefaultAPITokenCacheTTL
 	}
-	c := &Client{
-		cfg: cfg,
-		httpClient: &http.Client{
+	httpClient := cfg.HTTPClient
+	if httpClient == nil {
+		httpClient = &http.Client{
 			Timeout: 10 * time.Second,
-		},
-		apiTokens: newAPITokenCache(apiTokenTTL),
-		jwks:      newJWKSCache(cfg.jwksURL(), cfg.JWKSMinRefreshInterval, cfg.JWKSMaxAge),
+		}
+	}
+	c := &Client{
+		cfg:        cfg,
+		httpClient: httpClient,
+		apiTokens:  newAPITokenCache(apiTokenTTL),
+		jwks:       newJWKSCache(cfg.jwksURL(), cfg.JWKSMinRefreshInterval, cfg.JWKSMaxAge),
+	}
+	// The JWKS fetch goes through the same correlation as every other call,
+	// and through Config.HTTPClient when one is supplied.
+	c.jwks.prepare = c.applyCorrelation
+	if cfg.HTTPClient != nil {
+		c.jwks.httpClient = cfg.HTTPClient
 	}
 	if cfg.EnforceGrants {
 		ttl := cfg.GrantCacheTTL
@@ -51,7 +60,7 @@ func newClient(cfg Config) (*Client, error) {
 			ttl = 30 * time.Second
 		}
 		c.grants = newGrantCache(ttl)
-		log.Printf("go-forta: grant enforcement enabled (client_id=%s, api=%s, cache_ttl=%s)", cfg.ClientID, cfg.APIDomain, ttl)
+		c.logf("go-forta: grant enforcement enabled (client_id=%s, api=%s, cache_ttl=%s)", cfg.ClientID, cfg.APIDomain, ttl)
 	}
 	return c, nil
 }
@@ -74,13 +83,13 @@ func (c *Client) PingContext(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("go-forta: ping: %w", err)
 	}
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return fmt.Errorf("go-forta: ping: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("go-forta: ping: unexpected status %d", resp.StatusCode)
+		return newUpstreamError("ping", resp, fmt.Sprintf("go-forta: ping: unexpected status %d", resp.StatusCode))
 	}
 	return nil
 }
@@ -104,14 +113,14 @@ func (c *Client) exchangeCode(ctx context.Context, code string) (*AuthResponse, 
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return nil, fmt.Errorf("go-forta: exchange: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("go-forta: exchange: forta returned status %d", resp.StatusCode)
+		return nil, newUpstreamError("exchange", resp, fmt.Sprintf("go-forta: exchange: forta returned status %d", resp.StatusCode))
 	}
 
 	var envelope fortaEnvelope[AuthResponse]
@@ -134,17 +143,17 @@ func (c *Client) getUserInfo(ctx context.Context, accessToken string) (*User, er
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return nil, fmt.Errorf("go-forta: auth/self: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusUnauthorized {
-		return nil, fmt.Errorf("go-forta: auth/self: invalid or expired token")
+		return nil, newUpstreamError("auth/self", resp, "go-forta: auth/self: invalid or expired token")
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("go-forta: auth/self: forta returned status %d", resp.StatusCode)
+		return nil, newUpstreamError("auth/self", resp, fmt.Sprintf("go-forta: auth/self: forta returned status %d", resp.StatusCode))
 	}
 
 	var envelope fortaEnvelope[User]
@@ -165,17 +174,17 @@ func (c *Client) refreshTokens(ctx context.Context, refreshToken string) (*AuthR
 	req.Header.Set("Authorization", "Bearer "+refreshToken)
 	req.Header.Set("X-Forta-Client-ID", c.cfg.ClientID)
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return nil, fmt.Errorf("go-forta: refresh: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusUnauthorized {
-		return nil, fmt.Errorf("go-forta: refresh: invalid or expired refresh token")
+		return nil, newUpstreamError("auth/refresh", resp, "go-forta: refresh: invalid or expired refresh token")
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("go-forta: refresh: forta returned status %d", resp.StatusCode)
+		return nil, newUpstreamError("auth/refresh", resp, fmt.Sprintf("go-forta: refresh: forta returned status %d", resp.StatusCode))
 	}
 
 	var envelope fortaEnvelope[AuthResponse]
@@ -201,19 +210,19 @@ func (c *Client) checkGrant(ctx context.Context, accessToken string) (bool, erro
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return false, fmt.Errorf("go-forta: grant check: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusForbidden {
-		log.Printf("go-forta: grant denied for client_id=%s", c.cfg.ClientID)
+		c.logf("go-forta: grant denied for client_id=%s", c.cfg.ClientID)
 		return false, nil
 	}
 	if resp.StatusCode == http.StatusOK {
 		return true, nil
 	}
 
-	return false, fmt.Errorf("go-forta: grant check: unexpected status %d", resp.StatusCode)
+	return false, newUpstreamError("grant check", resp, fmt.Sprintf("go-forta: grant check: unexpected status %d", resp.StatusCode))
 }
