@@ -73,6 +73,9 @@ func Introspect(ctx context.Context, p *Provider, token, hint string) (*Introspe
 	// HTTP Basic per RFC 6749 §2.3.1 — the form of client authentication every
 	// introspection endpoint supports.
 	req.SetBasicAuth(p.ClientID, p.ClientSecret)
+	// Correlation ids carried by ctx (WithCorrelation, Checkpointer.Correlation),
+	// so an introspection is joinable to the request that triggered it.
+	applyCorrelation(req)
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
