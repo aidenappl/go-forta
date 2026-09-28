@@ -122,6 +122,10 @@ func (a *oidcAdapter) Exchange(ctx context.Context, code, verifier, nonce string
 	// sent at authorize time is unanswered and the exchange fails at any server
 	// that enforces PKCE — and silently succeeds at one that does not, which is the
 	// failure mode worth fearing.
+	// Correlation ids on ctx ride along on the exchange, id_token verification
+	// and UserInfo calls below, via the oauth2.HTTPClient context value.
+	ctx = withCorrelatingClient(ctx)
+
 	oauthToken, err := a.oauth.Exchange(ctx, code, oauth2.VerifierOption(verifier))
 	if err != nil {
 		return nil, nil, fmt.Errorf("sso: oidc code exchange: %w", err)

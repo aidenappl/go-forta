@@ -171,7 +171,7 @@ a fresh authentication. `sso/backchannel_test.go` asserts refusal of that and fi
 
 1. **`forta.LoginHandler`** — Redirects the browser to the Forta OAuth2 authorisation endpoint. Stores a CSRF state token in a short-lived HttpOnly cookie.
 2. **`forta.CallbackHandler`** — Validates the CSRF state, exchanges the authorisation code for a token pair via `POST /auth/exchange`, and writes `forta-access-token` / `forta-refresh-token` HttpOnly cookies.
-3. **`forta.Protected(next)`** — Middleware that reads the token from the `Authorization: Bearer` header or the `forta-access-token` cookie. Validates locally (no network) when `JWTSigningKey` is set, otherwise calls `/oauth/userinfo`. Transparently refreshes expired tokens.
+3. **`forta.Protected(next)`** — Middleware that reads the token from the `Authorization: Bearer` header or the `forta-access-token` cookie. Validates locally (no network) when `JWTSigningKey` is set, otherwise calls `/auth/self`. Transparently refreshes expired tokens.
 4. **`forta.LogoutHandler`** — Clears auth cookies and redirects.
 
 ---
@@ -272,6 +272,77 @@ exactly — no defaults are merged in.
 > either change lands; an older SDK rejects RS256 tokens and the URL issuer outright. Upgrade
 > `keyring-api` first — it is the boot-time secret source for the whole platform, so if it cannot
 > validate a Forta token, nothing starts.
+
+---
+
+## Observability: request correlation and failure reasons (v1.11.0)
+
+All optional. A consumer that sets none of this behaves exactly as on v1.10.0.
+
+**Every outbound call carries the host request's ids.** `/auth/self`, `/auth/refresh`,
+`/auth/exchange`, the grant check, the JWKS fetch, and in `sso` the introspection, token exchange
+and userinfo calls send `X-Request-ID`, `X-Trace-ID`, a W3C `traceparent` (when the trace id is a
+UUID or 32 hex) and `User-Agent: go-forta/<version>`. Only ids monitor-core accepts (a UUID or 8–64
+hex) are ever forwarded. `sso.FetchIcon` — a third-party host — never receives them.
+
+Ids are resolved per call, first match wins:
+
+1. `Config.Correlation(ctx)` / `Checkpointer.Correlation(ctx)`, when set;
+2. ids on the context — `forta.WithCorrelation(ctx, rid, tid)` / `sso.WithCorrelation(...)`;
+3. **root package only:** `Protected` and `CallbackHandler` stash them automatically from the
+   `X-Request-ID` / `X-Trace-ID` *response* headers your request-id middleware already set, then
+   from the inbound `X-Request-ID` / `traceparent` / `X-Trace-ID` request headers.
+
+Hosts on go-monitor:
+
+```go
+forta.Setup(forta.Config{
+    // ...
+    Correlation: func(ctx context.Context) (string, string) {
+        return monitor.RequestID(ctx), monitor.TraceID(ctx)
+    },
+})
+```
+
+Hosts with their own context key (monitor-core's `middleware.RequestIDKey`, say):
+
+```go
+Correlation: func(ctx context.Context) (string, string) {
+    rid, _ := ctx.Value(middleware.RequestIDKey).(string)
+    return rid, ""
+},
+```
+
+**Failure reasons.** `Config.OnAuthFailure(r, forta.AuthFailure)` fires immediately before
+`Protected`/`CallbackHandler`/`LoginHandler` write an error response. It never changes the
+response. `AuthFailure.Reason` is one of `ReasonMissingCredential`, `ReasonTokenInvalid`,
+`ReasonTokenExpired`, `ReasonRefreshFailed`, `ReasonAPITokenInvalid`,
+`ReasonUpstreamUnavailable`, `ReasonGrantDenied`, `ReasonGrantCheckFailed`,
+`ReasonExchangeFailed`, `ReasonCallbackInvalid`, `ReasonInternalError`. `UpstreamRequestID` is the
+`X-Request-ID` forta-api echoed on the failing call — search forta-api's logs for it. Non-2xx
+Forta responses surface as `*forta.UpstreamError{Op, Status, RequestID}` (use `errors.As`).
+
+```go
+OnAuthFailure: func(r *http.Request, f forta.AuthFailure) {
+    data := map[string]any{"reason": f.Reason, "status": f.Status, "upstream_request_id": f.UpstreamRequestID}
+    if f.Err != nil {
+        data["error"] = f.Err.Error()
+    }
+    monitor.Warn(r.Context(), "auth.forta_rejected", data)
+},
+```
+
+`ReasonUpstreamUnavailable` is the one that matters in an incident: Forta was unreachable or
+answered 5xx/429, so the credential was **never judged**. The client still gets the same 401 it
+always did (and the remote path still attempts a refresh) — only the reported reason differs.
+
+`Config.Logf` routes the SDK's log lines (default `log.Printf`); `Config.HTTPClient` replaces the
+client used for Forta API and JWKS calls.
+
+**`sso.Checkpointer`** gains `Correlation`, `LogfCtx` (preferred over `Logf`, receives the Check
+ctx) and `OnResult(ctx, userID, result, cause)`. ⚠️ **Ids travel on the context — pass the request
+context into `Check` and `Exchange`, not `context.Background()`.** Concurrent checks for one user
+share one introspection, which carries the ids of the request that started it.
 
 ---
 

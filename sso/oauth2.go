@@ -78,7 +78,7 @@ func (a *oauth2Adapter) Exchange(ctx context.Context, code, verifier, nonce stri
 	// every login perform a failing request first.
 	//
 	// One request, the standard library's, with the verifier attached.
-	oauthToken, err := a.oauth.Exchange(ctx, code, oauth2.VerifierOption(verifier))
+	oauthToken, err := a.oauth.Exchange(withCorrelatingClient(ctx), code, oauth2.VerifierOption(verifier))
 	if err != nil {
 		return nil, nil, fmt.Errorf("sso: oauth2 code exchange: %w", err)
 	}
@@ -145,6 +145,7 @@ func (a *oauth2Adapter) userInfo(ctx context.Context, accessToken string) (map[s
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Accept", "application/json")
+	applyCorrelation(req)
 
 	resp, err := httpClient.Do(req)
 	if err != nil {

@@ -7,6 +7,8 @@ import (
 	"log"
 	"sync"
 	"time"
+
+	"github.com/aidenappl/go-forta/internal/correlate"
 )
 
 // CheckpointInterval is how long a successful check is trusted before the
@@ -104,6 +106,35 @@ type Checkpointer struct {
 	// that ends up somewhere less protected than the database.
 	Logf func(format string, args ...any)
 
+	// ── Observability (v1.11.0). All optional; nil means previous behaviour. ──
+
+	// Correlation returns the request id and trace id to forward on the
+	// introspection call (X-Request-ID, X-Trace-ID, traceparent). Optional. When
+	// nil, or when it returns "" for an id, the ids carried by ctx are used
+	// (WithCorrelation). Ids that are not a UUID or 8-64 hex are never forwarded.
+	//
+	// ⚠️ Concurrent checks for one user share ONE introspection, and that call
+	// carries the ids of whichever request started it. The other requests waiting
+	// on it do not appear on the IdP side under their own ids.
+	//
+	// ⚠️ Pass the request context into Check. A context.Background() carries no
+	// ids for the fallback, and gives the hook nothing to read.
+	Correlation func(ctx context.Context) (requestID, traceID string)
+
+	// LogfCtx, when set, receives every log line instead of Logf, with the ctx of
+	// the Check that produced it — so a structured logger can attach the
+	// request's ids. Same content rules as Logf.
+	LogfCtx func(ctx context.Context, format string, args ...any)
+
+	// OnResult, when set, is called once per Check that got past the cheap
+	// early returns (no Sessions configured, no session row, checked within
+	// Interval) — i.e. whenever a decision involved the session store failing,
+	// the provider lookup, or introspection. cause is the error that shaped the
+	// result (session load failure, provider lookup failure, introspection
+	// failure), or nil. Use it to emit a metric or event; it must not block for long, as
+	// it runs on the request path.
+	OnResult func(ctx context.Context, userID int64, r CheckpointResult, cause error)
+
 	// inflight collapses concurrent introspections for the same user.
 	//
 	// ⚠️ A Checkpointer MUST NOT BE COPIED once used — this field carries a mutex.
@@ -192,7 +223,11 @@ func (c *Checkpointer) grace() time.Duration {
 	return CheckpointGrace
 }
 
-func (c *Checkpointer) logf(format string, args ...any) {
+func (c *Checkpointer) logf(ctx context.Context, format string, args ...any) {
+	if c.LogfCtx != nil {
+		c.LogfCtx(ctx, format, args...)
+		return
+	}
 	if c.Logf != nil {
 		c.Logf(format, args...)
 		return
@@ -214,6 +249,13 @@ func (c *Checkpointer) logf(format string, args ...any) {
 //  4. active:false → REVOKED, immediately, no grace.
 //  5. NO ANSWER → OK while inside the grace window, UNAVAILABLE once outside it.
 func (c *Checkpointer) Check(ctx context.Context, userID int64) CheckpointResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if c.Correlation != nil {
+		rid, tid := c.Correlation(ctx)
+		ctx = correlate.With(ctx, rid, tid)
+	}
 	if c.Sessions == nil {
 		// Nothing configured to check against. OK rather than deny: a missing
 		// configuration must not be a platform-wide outage.
@@ -226,8 +268,8 @@ func (c *Checkpointer) Check(ctx context.Context, userID int64) CheckpointResult
 		// the request was going to fail anyway; passing here keeps the checkpoint from
 		// being the thing that reports it, and bounded by the fact that nothing else
 		// will work either.
-		c.logf("sso: checkpoint: load session for user %d failed, passing: %v", userID, err)
-		return CheckpointOK
+		c.logf(ctx, "sso: checkpoint: load session for user %d failed, passing: %v", userID, err)
+		return c.result(ctx, userID, CheckpointOK, err)
 	}
 	if sess == nil {
 		return CheckpointOK
@@ -238,13 +280,16 @@ func (c *Checkpointer) Check(ctx context.Context, userID int64) CheckpointResult
 	}
 
 	if c.Providers == nil {
-		c.logf("sso: checkpoint: no provider lookup configured, passing user %d", userID)
-		return CheckpointOK
+		c.logf(ctx, "sso: checkpoint: no provider lookup configured, passing user %d", userID)
+		return c.result(ctx, userID, CheckpointOK, nil)
 	}
 	provider, err := c.Providers(ctx, sess.Provider)
 	if err != nil || provider == nil {
-		c.logf("sso: checkpoint: load provider %q for user %d failed, passing: %v", sess.Provider, userID, err)
-		return c.graceOrUnavailable(ctx, userID, sess)
+		c.logf(ctx, "sso: checkpoint: load provider %q for user %d failed, passing: %v", sess.Provider, userID, err)
+		if err == nil {
+			err = fmt.Errorf("sso: checkpoint: provider %q not found", sess.Provider)
+		}
+		return c.result(ctx, userID, c.graceOrUnavailable(ctx, userID, sess), err)
 	}
 
 	if provider.IntrospectURL == "" {
@@ -255,7 +300,7 @@ func (c *Checkpointer) Check(ctx context.Context, userID int64) CheckpointResult
 		// at the IdP is invisible until the local session ends on its own. It is a
 		// reason to configure introspect_url, not a reason to deny the session.
 		c.touch(ctx, userID)
-		return CheckpointOK
+		return c.result(ctx, userID, CheckpointOK, nil)
 	}
 
 	// Prefer the refresh token: it is the long-lived half, so it remains
@@ -267,9 +312,9 @@ func (c *Checkpointer) Check(ctx context.Context, userID int64) CheckpointResult
 		token, hint = sess.Tokens.AccessToken, "access_token"
 	}
 	if token == "" {
-		c.logf("sso: checkpoint: session for user %d has no token to introspect, passing", userID)
+		c.logf(ctx, "sso: checkpoint: session for user %d has no token to introspect, passing", userID)
 		c.touch(ctx, userID)
-		return CheckpointOK
+		return c.result(ctx, userID, CheckpointOK, nil)
 	}
 
 	// context.WithoutCancel is deliberate. The call may be SHARED with other
@@ -278,13 +323,17 @@ func (c *Checkpointer) Check(ctx context.Context, userID int64) CheckpointResult
 	// turning a disconnect into a spurious CheckpointUnavailable for unrelated
 	// traffic. Introspect applies its own introspectTimeout, so detaching from
 	// cancellation does not detach from a deadline.
+	//
+	// WithoutCancel keeps ctx's VALUES, so the correlation ids resolved above ride
+	// along — but only the first caller's: a request that joins an in-flight call
+	// shares that call's ids, not its own.
 	resp, err, _ := c.inflight.do(userID, func() (*IntrospectResponse, error) {
 		return Introspect(context.WithoutCancel(ctx), provider, token, hint)
 	})
 	if err != nil {
 		// NO ANSWER. Not a revocation.
-		c.logf("sso: checkpoint: introspect for user %d via %q failed: %v", userID, sess.Provider, err)
-		return c.graceOrUnavailable(ctx, userID, sess)
+		c.logf(ctx, "sso: checkpoint: introspect for user %d via %q failed: %v", userID, sess.Provider, err)
+		return c.result(ctx, userID, c.graceOrUnavailable(ctx, userID, sess), err)
 	}
 
 	if !resp.Active {
@@ -293,10 +342,10 @@ func (c *Checkpointer) Check(ctx context.Context, userID int64) CheckpointResult
 		// The IdP was reachable, authenticated us, and said this grant is gone. That
 		// is the one unambiguous signal in the whole mechanism, and the entire point
 		// of running a checkpoint is to act on it the moment it arrives.
-		c.logf("sso: checkpoint: upstream grant for user %d via %q is inactive — ending session", userID, sess.Provider)
+		c.logf(ctx, "sso: checkpoint: upstream grant for user %d via %q is inactive — ending session", userID, sess.Provider)
 
 		if err := c.Sessions.DeleteSession(ctx, userID); err != nil {
-			c.logf("sso: checkpoint: failed to delete revoked session for user %d: %v", userID, err)
+			c.logf(ctx, "sso: checkpoint: failed to delete revoked session for user %d: %v", userID, err)
 		}
 
 		// Deleting the session row is not necessarily enough. If the application also
@@ -305,14 +354,22 @@ func (c *Checkpointer) Check(ctx context.Context, userID int64) CheckpointResult
 		// it. LocalTokenRevoker is the hook that closes it.
 		if revoker, ok := c.Sessions.(LocalTokenRevoker); ok {
 			if err := revoker.RevokeLocalTokens(ctx, userID); err != nil {
-				c.logf("sso: checkpoint: failed to revoke local tokens for user %d: %v", userID, err)
+				c.logf(ctx, "sso: checkpoint: failed to revoke local tokens for user %d: %v", userID, err)
 			}
 		}
-		return CheckpointRevoked
+		return c.result(ctx, userID, CheckpointRevoked, nil)
 	}
 
 	c.touch(ctx, userID)
-	return CheckpointOK
+	return c.result(ctx, userID, CheckpointOK, nil)
+}
+
+// result reports r through OnResult, when set, and returns it.
+func (c *Checkpointer) result(ctx context.Context, userID int64, r CheckpointResult, cause error) CheckpointResult {
+	if c.OnResult != nil {
+		c.OnResult(ctx, userID, r, cause)
+	}
+	return r
 }
 
 // graceOrUnavailable applies the bounded fail-open rule.
@@ -326,7 +383,7 @@ func (c *Checkpointer) graceOrUnavailable(ctx context.Context, userID int64, ses
 		// Never successfully checked. There is no last-known-good to extend, so there
 		// is nothing to fail open ONTO — the session has never been confirmed against
 		// the IdP at all.
-		c.logf("sso: checkpoint: user %d has never been checked and the IdP is unreachable — unavailable", userID)
+		c.logf(ctx, "sso: checkpoint: user %d has never been checked and the IdP is unreachable — unavailable", userID)
 		return CheckpointUnavailable
 	}
 
@@ -334,7 +391,7 @@ func (c *Checkpointer) graceOrUnavailable(ctx context.Context, userID int64, ses
 		return CheckpointOK
 	}
 
-	c.logf("sso: checkpoint: user %d unverified for longer than the %s grace window — unavailable", userID, c.grace())
+	c.logf(ctx, "sso: checkpoint: user %d unverified for longer than the %s grace window — unavailable", userID, c.grace())
 	return CheckpointUnavailable
 }
 
@@ -342,7 +399,7 @@ func (c *Checkpointer) touch(ctx context.Context, userID int64) {
 	if err := c.Sessions.TouchSession(ctx, userID); err != nil {
 		// Not fatal: the check itself succeeded. The only cost is that the next request
 		// re-checks, which is wasted work rather than a wrong answer.
-		c.logf("sso: checkpoint: failed to touch session for user %d: %v", userID, err)
+		c.logf(ctx, "sso: checkpoint: failed to touch session for user %d: %v", userID, err)
 	}
 }
 

@@ -1,8 +1,10 @@
 package forta
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 )
@@ -66,7 +68,7 @@ type Config struct {
 	// JWTSigningKey is the HMAC-SHA512 key the Forta server uses to sign its
 	// access tokens. When set, token validation is done entirely in-process
 	// with no network round-trip. When empty, each Protected request will
-	// call the /oauth/userinfo endpoint to validate the token and the full User
+	// call the /auth/self endpoint to validate the token and the full User
 	// object is automatically available in the context.
 	JWTSigningKey string
 
@@ -120,7 +122,7 @@ type Config struct {
 	EnableJWKS bool
 
 	// FetchUserOnProtect controls whether the Protected middleware fetches the
-	// full user profile from /oauth/userinfo on every authenticated request.
+	// full user profile from /auth/self on every authenticated request.
 	// Only relevant when JWTSigningKey is set (local validation). When false,
 	// only the Forta user ID is available in the context via GetFortaIDFromContext.
 	// When true, the full User is also available via GetUserFromContext.
@@ -147,6 +149,43 @@ type Config struct {
 	// revocation latency: a token revoked in Forta keeps working for at most
 	// this long. Default: 60 seconds.
 	APITokenCacheTTL time.Duration
+
+	// ── Observability (v1.11.0). All optional; nil means previous behaviour. ──
+
+	// Correlation returns the request id and trace id to forward to Forta on
+	// outbound calls made with ctx (as X-Request-ID, X-Trace-ID and a W3C
+	// traceparent). Optional. When nil, or when it returns "" for an id, the ids
+	// carried by the context are used instead — set with WithCorrelation, or
+	// stashed automatically by Protected/CallbackHandler from the X-Request-ID /
+	// X-Trace-ID response headers a host request-id middleware set, then from the
+	// inbound X-Request-ID / traceparent / X-Trace-ID request headers.
+	//
+	// Ids that are not a UUID or 8-64 hex characters are never forwarded.
+	//
+	// go-monitor hosts:
+	//
+	//	Correlation: func(ctx context.Context) (string, string) {
+	//	    return monitor.RequestID(ctx), monitor.TraceID(ctx)
+	//	},
+	Correlation func(ctx context.Context) (requestID, traceID string)
+
+	// OnAuthFailure is called immediately before Protected, CallbackHandler or
+	// LoginHandler writes an error response, with a structured reason. Optional.
+	// It never changes the response. It must not write to the response body.
+	//
+	// It is how a host tells "the token was bad" from "Forta was unreachable",
+	// which produce the same 401 today.
+	OnAuthFailure func(r *http.Request, f AuthFailure)
+
+	// Logf receives every log line this package writes. Optional; defaults to
+	// log.Printf. Lines never contain token values.
+	Logf func(format string, args ...any)
+
+	// HTTPClient is used for every call to the Forta API and for the JWKS fetch.
+	// Optional; defaults to a client with a 10s timeout (API) and a 5s timeout
+	// (JWKS). The JWKS fetch is additionally bounded by a 5s context deadline
+	// regardless of this client's own timeout.
+	HTTPClient *http.Client
 }
 
 // String returns a human-readable representation of the config with secrets

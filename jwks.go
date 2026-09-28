@@ -100,6 +100,9 @@ type jwk struct {
 type jwksCache struct {
 	url        string
 	httpClient *http.Client
+	// prepare, when set, is applied to every outbound JWKS request before it is
+	// sent (correlation ids, User-Agent). The Client sets it; nil does nothing.
+	prepare    func(*http.Request)
 	minRefresh time.Duration
 	maxAge     time.Duration
 
@@ -290,6 +293,9 @@ func (j *jwksCache) fetch(ctx context.Context) (map[string]*rsa.PublicKey, time.
 		return nil, 0, fmt.Errorf("go-forta: jwks: request: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
+	if j.prepare != nil {
+		j.prepare(req)
+	}
 
 	resp, err := j.httpClient.Do(req)
 	if err != nil {
@@ -298,7 +304,7 @@ func (j *jwksCache) fetch(ctx context.Context) (map[string]*rsa.PublicKey, time.
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, 0, fmt.Errorf("go-forta: jwks: unexpected status %d", resp.StatusCode)
+		return nil, 0, newUpstreamError("jwks", resp, fmt.Sprintf("go-forta: jwks: unexpected status %d", resp.StatusCode))
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, jwksMaxBodyBytes))
