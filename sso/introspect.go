@@ -77,7 +77,7 @@ func Introspect(ctx context.Context, p *Provider, token, hint string) (*Introspe
 	// so an introspection is joinable to the request that triggered it.
 	applyCorrelation(req)
 
-	resp, err := httpClient.Do(req)
+	resp, err := p.client().Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("sso: introspect: %w", err)
 	}

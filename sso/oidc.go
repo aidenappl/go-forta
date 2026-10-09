@@ -1,6 +1,7 @@
 package sso
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -38,7 +39,14 @@ func discover(ctx context.Context, issuer string) (*oidc.Provider, error) {
 	discoveryMu.Lock()
 	defer discoveryMu.Unlock()
 
-	if p, ok := discoveryCache[issuer]; ok {
+	// Keyed by the client too: go-oidc keeps the discovery context's client for
+	// every later JWKS fetch, so a provider discovered under one client must not
+	// be served to a caller that configured another (Provider.HTTPClient).
+	key := issuer
+	if c, ok := ctx.Value(oauth2.HTTPClient).(*http.Client); ok && c != nil {
+		key = fmt.Sprintf("%s\x00%p", issuer, c)
+	}
+	if p, ok := discoveryCache[key]; ok {
 		return p, nil
 	}
 
@@ -49,7 +57,7 @@ func discover(ctx context.Context, issuer string) (*oidc.Provider, error) {
 	if err != nil {
 		return nil, fmt.Errorf("sso: oidc discovery for %q: %w", issuer, err)
 	}
-	discoveryCache[issuer] = p
+	discoveryCache[key] = p
 	return p, nil
 }
 
@@ -62,7 +70,7 @@ type oidcAdapter struct {
 }
 
 func newOIDCAdapter(ctx context.Context, p *Provider) (Adapter, error) {
-	op, err := discover(ctx, p.IssuerURL)
+	op, err := discover(withProviderClient(ctx, p), p.IssuerURL)
 	if err != nil {
 		return nil, err
 	}
@@ -124,7 +132,7 @@ func (a *oidcAdapter) Exchange(ctx context.Context, code, verifier, nonce string
 	// failure mode worth fearing.
 	// Correlation ids on ctx ride along on the exchange, id_token verification
 	// and UserInfo calls below, via the oauth2.HTTPClient context value.
-	ctx = withCorrelatingClient(ctx)
+	ctx = withCorrelatingClient(withProviderClient(ctx, a.provider))
 
 	oauthToken, err := a.oauth.Exchange(ctx, code, oauth2.VerifierOption(verifier))
 	if err != nil {
@@ -151,8 +159,12 @@ func (a *oidcAdapter) Exchange(ctx context.Context, code, verifier, nonce string
 		return nil, nil, fmt.Errorf("sso: oidc id_token nonce mismatch")
 	}
 
-	var claims map[string]any
-	if err := idToken.Claims(&claims); err != nil {
+	var rawClaims json.RawMessage
+	if err := idToken.Claims(&rawClaims); err != nil {
+		return nil, nil, fmt.Errorf("sso: oidc claim decode: %w", err)
+	}
+	claims, err := decodeClaims(rawClaims)
+	if err != nil {
 		return nil, nil, fmt.Errorf("sso: oidc claim decode: %w", err)
 	}
 
@@ -246,8 +258,12 @@ func (a *oidcAdapter) fetchUserInfo(ctx context.Context, tok *oauth2.Token, idTo
 			ui.Subject, idTokenSubject)
 	}
 
-	var claims map[string]any
-	if err := ui.Claims(&claims); err != nil {
+	var rawClaims json.RawMessage
+	if err := ui.Claims(&rawClaims); err != nil {
+		return nil, fmt.Errorf("sso: oidc userinfo claim decode: %w", err)
+	}
+	claims, err := decodeClaims(rawClaims)
+	if err != nil {
 		return nil, fmt.Errorf("sso: oidc userinfo claim decode: %w", err)
 	}
 	return claims, nil
@@ -267,14 +283,39 @@ func readLimited(r io.Reader, n int64) ([]byte, error) {
 // document — a large id_token with many claims is a few kilobytes.
 const maxResponseBytes = 1 << 20 // 1 MiB
 
+// decodeClaims decodes a JSON object into a claim map, keeping numbers as
+// json.Number.
+//
+// ⚠️ PLAIN json.Unmarshal INTO map[string]any IS WRONG FOR CLAIMS. It turns every
+// number into a float64, and fmt.Sprint of a float64 uses %v — so GitHub's
+// numeric `id` 12345678 became the subject "1.2345678e+07", and ids above 2^53
+// lose digits outright. A subject is an identity key; it must round-trip
+// exactly. json.Number is the literal text of the number, so it does.
+func decodeClaims(b []byte) (map[string]any, error) {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.UseNumber()
+	var claims map[string]any
+	if err := dec.Decode(&claims); err != nil {
+		return nil, err
+	}
+	if claims == nil {
+		// A JSON `null` decodes to a nil map without error; callers index and
+		// write into it, so refuse it here.
+		return nil, fmt.Errorf("claims are null, not an object")
+	}
+	return claims, nil
+}
+
 // claimString reads a string claim by the configured name, falling back to the
 // standard name.
 //
 // Values are stringified via fmt.Sprint so a numeric `sub` — which some providers
 // emit despite the specification requiring a string — is read rather than
-// silently dropped. "<nil>" is filtered because that is what fmt.Sprint produces
-// for a JSON null, and a literal "<nil>" subject would be a shared identity for
-// every user whose claim was null.
+// silently dropped. Numbers arrive as json.Number (see decodeClaims), so the
+// stringified form is the exact integer text, never a float. "<nil>" is
+// filtered because that is what fmt.Sprint produces for a JSON null, and a
+// literal "<nil>" subject would be a shared identity for every user whose claim
+// was null.
 func claimString(claims map[string]any, field, fallback string) string {
 	for _, f := range []string{field, fallback} {
 		if f == "" {

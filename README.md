@@ -131,6 +131,35 @@ against the identity provider that is already down.
 Full details — the seams, the checkpoint decision table, and why the test fixture is a real
 server rather than a mock — in [`AGENTS.md`](AGENTS.md).
 
+### Plain OAuth2 providers (GitHub)
+
+`KindOAuth2` is the weaker compatibility path for providers with no OIDC (read its type comment
+first). GitHub's `/user` has no `sub` and a **numeric** `id`, which becomes the subject exactly
+(`"12345678"`) — claims are decoded with `json.Number`, never `float64`. It also returns
+`"email": null` for private addresses, so set `EmailsURL` to fall back to `/user/emails`:
+
+```go
+p := &sso.Provider{
+    Slug:         "github",
+    Kind:         sso.KindOAuth2,
+    AuthorizeURL: "https://github.com/login/oauth/authorize",
+    TokenURL:     "https://github.com/login/oauth/access_token",
+    UserInfoURL:  "https://api.github.com/user",
+    EmailsURL:    "https://api.github.com/user/emails", // needs the user:email scope
+    Scopes:       "read:user user:email",
+    // ClientID, ClientSecret, RedirectURL …
+}
+```
+
+The fallback only runs when UserInfo had no email. It picks the primary verified address, then the
+first verified one; an unverified-only list yields `EmailVerified=false`. GitHub's per-address
+`verified` flag is authoritative — `TrustEmailVerified` does not apply to a fallback address. A
+non-200, malformed, or empty response fails the login. `EmailsURL` is rejected on `KindOIDC`.
+
+⚠️ **Upgrading to v1.12.0:** numeric subjects used to be stored as floats (`"1.2345678e+07"`) and
+now come out exact (`"12345678"`). Backfill any identity rows whose subject contains `e+` before
+bumping — see the v1.12.0 release notes in [`AGENTS.md`](AGENTS.md).
+
 ### Back-channel logout (optional, and the checkpoint is not enough without it)
 
 The checkpoint above re-introspects every 5 minutes, so a revoked grant keeps working for up to

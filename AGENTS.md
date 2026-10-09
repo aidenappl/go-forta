@@ -477,6 +477,31 @@ Tagged releases consumed via the Go module proxy, which caches immutably.
 proxy entries cannot be rewritten, that feature shipped as **v1.3.0**. Never retag a published
 version — cut a new one.
 
+**Release notes — v1.12.0 (sso: exact numeric claims + GitHub email fallback).** Minor bump. New
+exported surface: `sso.Provider.EmailsURL` (`KindOAuth2` only; `Validate` rejects it on
+`KindOIDC` and requires an absolute http(s) URL), `ssotest.FakeIDP.ExtraClaims` and
+`ssotest.FakeIDP.UserInfoExtraClaims`, and `sso.Provider.HTTPClient` — when set it carries EVERY call
+to that provider (OIDC discovery, JWKS, token exchange, OIDC/OAuth2 UserInfo, `EmailsURL`,
+introspection) so a consumer can enforce a dial-time SSRF policy that also covers endpoints
+discovery returned; nil keeps the package default, and `FetchIcon` is unaffected. OIDC discovery is
+now cached per (issuer, client) rather than per issuer (go-oidc keeps the discovery client for JWKS
+fetches); consumers that never set `HTTPClient` see no change. ⚠️ **Cache-growth caveat:** the discovery cache is never evicted and its key includes the client's
+POINTER, so a consumer that builds a new `*http.Client` per request (or per provider load) adds a
+cache entry — a discovered provider plus its JWKS key set — on every login, an unbounded memory
+leak. Build one client per policy at startup and reuse that value (dbdiagram-api keeps exactly
+two: guarded and private-allowed). Pinned by `sso/httpclient_test.go`
+(mutation-checked). No new module dependency. `User-Agent` is now
+`go-forta/1.12.0`. In the `KindOAuth2` adapter, `EmailVerified` is now forced false whenever
+`Email` is empty (previously `TrustEmailVerified` could set it with no address); the OIDC adapter
+is unchanged there.
+⚠️ **BEHAVIOUR CHANGE — identity keys.** Every claim map (OAuth2 UserInfo, id_token, OIDC UserInfo)
+is now decoded with `json.Number`. A numeric subject that previously stringified as a float
+(GitHub `id` 12345678 → `"1.2345678e+07"`; ids above 2^53 lost digits) now comes out exact
+(`"12345678"`). **Before bumping, a consumer must check its identity table for subjects containing
+`e+` (e.g. `WHERE subject LIKE '%e+%'`) and backfill them to the exact integer**, or those users'
+next login misses their existing identity and is linked, provisioned as a duplicate, or refused.
+Ids above 2^53 cannot be recovered from the float form; re-derive them from the provider.
+
 **Release notes — v1.11.0 (request correlation + failure observability).** Minor bump, purely
 additive. New exported surface: `Version`, `WithCorrelation`, `AuthFailure`, `UpstreamError`, the
 `Reason*` constants, `Config.Correlation`, `Config.OnAuthFailure`, `Config.Logf`,
@@ -554,6 +579,32 @@ adopting services have three different ones and one has no provider table at all
 
 `LocalTokenRevoker` is optional. Implement it if your app issues tokens that outlive the session
 row — otherwise the checkpoint detects revocation and changes nothing.
+
+### Claim decoding and plain-OAuth2 providers (GitHub)
+
+- **Every claim map is decoded through `decodeClaims` (`sso/oidc.go`)** — `json.Decoder` with
+  `UseNumber()` — for the OAuth2 UserInfo body, the verified id_token claims, and OIDC UserInfo.
+  Plain `json.Unmarshal` into `map[string]any` makes numbers `float64`, and `claimString`'s
+  `fmt.Sprint` then turned GitHub's numeric `id` 12345678 into the subject `"1.2345678e+07"` (and
+  ids above 2^53 lose digits). With `json.Number` the subject is the exact integer text.
+- **`Provider.EmailsURL`** (`KindOAuth2` only; `Validate` rejects it on `KindOIDC` and requires an
+  absolute `http(s)` URL) is a fallback for providers whose UserInfo omits the email — GitHub's
+  `/user` returns `"email": null` for private addresses. Called only when UserInfo carried no
+  email, with the same access token, timeout (`userInfoTimeout`), `httpClient`, body limit and
+  correlation headers as the UserInfo call. Expects GitHub's `/user/emails` shape
+  `[{email, primary, verified, visibility}]`; picks primary+verified, then first verified, else
+  the primary/first address with `EmailVerified=false`. **The per-address `verified` flag is
+  authoritative — `TrustEmailVerified` does not apply to a fallback address** (it still applies to
+  an email asserted in the profile). `EmailVerified` is always false when `Email` is empty. A
+  non-200, malformed body, or list with no usable address **fails the login** (usually a missing
+  `user:email` scope). The fallback address is set on `Identity.Email` only; `RawClaims` is the
+  UserInfo response and does not contain it.
+- GitHub config: `AuthorizeURL https://github.com/login/oauth/authorize`, `TokenURL
+  https://github.com/login/oauth/access_token`, `UserInfoURL https://api.github.com/user`,
+  `EmailsURL https://api.github.com/user/emails`, `Scopes "read:user user:email"`. The subject
+  falls back to `id` because GitHub sends no `sub`.
+- Tests: `sso/claims_test.go` (a GitHub-shaped `httptest` provider plus a `FakeIDP` numeric
+  id_token claim).
 
 ### Back-channel logout (`sso/backchannel.go`)
 
@@ -681,7 +732,9 @@ verifier, no id_token to put a wrong nonce in, and no second identity to conflic
 
 `FakeIDP` injects one specific misbehaviour per field: `OmitIDToken`, `WrongNonce`,
 `WrongAudience`, `WrongIssuer`, `ExpiredIDToken`, `UnsignedIDToken`, `UnknownKID`,
-`UserInfoSubject`, `IgnorePKCE`, `IntrospectActive`, `IntrospectStatus`.
+`UserInfoSubject`, `IgnorePKCE`, `IntrospectActive`, `IntrospectStatus`. `ExtraClaims` and
+`UserInfoExtraClaims` are not failure injections: the first adds arbitrary claims (e.g. a numeric
+id) to both the id_token and UserInfo, the second to UserInfo only.
 
 ⚠️ **`IgnorePKCE` is the most important one.** It models a real authorization server that does
 not enforce PKCE — the only condition under which a client's dropped verifier goes unnoticed. A
@@ -772,6 +825,8 @@ the question is whether it would go red.
 - **Do not collapse "no answer" into `active: false`.** Different facts, different correct
   responses; conflating them is a platform-wide logout.
 - **Do not make `CheckpointUnavailable` a 401.**
+- **Do not decode claims with plain `json.Unmarshal` into `map[string]any`.** Use `decodeClaims`;
+  a `float64` subject is a corrupted identity key.
 - **`sso/ssotest` is test-only.** It signs with a per-instance key and accepts any client secret.
   Never import it outside a test binary.
 

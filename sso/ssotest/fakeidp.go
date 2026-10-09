@@ -95,6 +95,17 @@ type FakeIDP struct {
 	// back-channel logout ends.
 	UserInfoSID string
 
+	// ExtraClaims are added to BOTH the id_token and the UserInfo response, after
+	// the standard claims (so a key here overrides one). It exists for claim
+	// shapes the named fields cannot express — a numeric id, say, which a
+	// relying party must stringify exactly.
+	ExtraClaims map[string]any
+
+	// UserInfoExtraClaims are added to the UserInfo response ONLY (after
+	// ExtraClaims), so a test can exercise the UserInfo decode path with a claim
+	// the id_token does not carry.
+	UserInfoExtraClaims map[string]any
+
 	// IgnorePKCE makes the token endpoint accept an exchange with no or wrong
 	// code_verifier.
 	//
@@ -366,6 +377,9 @@ func (f *FakeIDP) mintIDToken(nonce, clientID string) (string, error) {
 	if f.IDTokenSID != "" {
 		claims["sid"] = f.IDTokenSID
 	}
+	for k, v := range f.ExtraClaims {
+		claims[k] = v
+	}
 
 	if f.UnsignedIDToken {
 		tok := jwt.NewWithClaims(jwt.SigningMethodNone, claims)
@@ -400,6 +414,12 @@ func (f *FakeIDP) handleUserInfo(w http.ResponseWriter, r *http.Request) {
 	}
 	if f.UserInfoSID != "" {
 		body["sid"] = f.UserInfoSID
+	}
+	for k, v := range f.ExtraClaims {
+		body[k] = v
+	}
+	for k, v := range f.UserInfoExtraClaims {
+		body[k] = v
 	}
 	writeJSON(w, http.StatusOK, body)
 }
