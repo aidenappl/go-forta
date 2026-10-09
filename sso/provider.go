@@ -49,8 +49,13 @@
 package sso
 
 import (
+	"context"
 	"fmt"
+	"net/http"
+	"net/url"
 	"strings"
+
+	"golang.org/x/oauth2"
 )
 
 // Kind selects which adapter drives a provider.
@@ -169,6 +174,61 @@ type Provider struct {
 	// response is discarded (OIDC Core §5.3.2). That check is not optional and
 	// not configurable — see fetchUserInfo.
 	FetchUserInfo bool
+
+	// EmailsURL is an optional KindOAuth2 fallback for providers whose UserInfo
+	// response omits the email — GitHub's `/user` returns `"email": null` for any
+	// user with a private address. When set and UserInfo carried no email, it is
+	// fetched with the access token and must return GitHub's `/user/emails`
+	// shape: `[{"email","primary","verified","visibility"}]`. The primary verified
+	// address wins, then the first verified one; with neither, an unverified
+	// address is returned with EmailVerified=false. The per-address `verified`
+	// flag is authoritative — TrustEmailVerified does NOT apply to an address
+	// obtained this way. The fallback address is set on Identity.Email only;
+	// Identity.RawClaims is the UserInfo response and does not include it.
+	//
+	// For GitHub: "https://api.github.com/user/emails", with the `user:email`
+	// scope. A failed fetch — non-200, malformed, or no usable address — fails
+	// the login rather than continuing email-less.
+	//
+	// Rejected on KindOIDC: an OIDC provider asserts email in its claims (use
+	// FetchUserInfo), and silently ignoring the field would hide a misconfiguration.
+	EmailsURL string
+
+	// HTTPClient, when set, carries EVERY outbound call this package makes to
+	// the provider: OIDC discovery, the JWKS fetch, the token exchange, OIDC and
+	// OAuth2 UserInfo, the EmailsURL fallback and introspection. nil keeps the
+	// package default (a 15s-timeout client) — the previous behaviour.
+	//
+	// It exists so a multi-tenant application can enforce an SSRF policy at DIAL
+	// time (refusing private, loopback, link-local and CGNAT addresses, and
+	// refusing redirects) for endpoints an administrator typed in — including
+	// the ones discovery returns, which a save-time URL check never sees.
+	// FetchIcon is unaffected: it has its own guard.
+	//
+	// ⚠️ OIDC discovery is cached per (issuer, HTTPClient). Reuse one client
+	// value per policy rather than building a new one per request, or the cache
+	// never hits.
+	HTTPClient *http.Client `json:"-"`
+}
+
+// client is the HTTP client for calls to this provider.
+func (p *Provider) client() *http.Client {
+	if p != nil && p.HTTPClient != nil {
+		return p.HTTPClient
+	}
+	return httpClient
+}
+
+// withProviderClient puts the provider's HTTPClient on ctx under
+// oauth2.HTTPClient, which is where x/oauth2 (token exchange) and go-oidc
+// (discovery, JWKS, UserInfo) look for one. The provider's client wins over
+// one already on ctx: it is the policy the application configured for this
+// provider. No-op when HTTPClient is nil.
+func withProviderClient(ctx context.Context, p *Provider) context.Context {
+	if p == nil || p.HTTPClient == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, oauth2.HTTPClient, p.HTTPClient)
 }
 
 // Validate reports whether the provider is usable, with an error naming the
@@ -202,6 +262,9 @@ func (p *Provider) Validate() error {
 			// silently skipping means the sub check silently does not happen.
 			return fmt.Errorf("sso: oidc provider %q asks for userinfo but no endpoint is known", p.Slug)
 		}
+		if p.EmailsURL != "" {
+			return fmt.Errorf("sso: oidc provider %q sets emails_url, which only applies to kind %q (use FetchUserInfo)", p.Slug, KindOAuth2)
+		}
 	case KindOAuth2:
 		if p.AuthorizeURL == "" {
 			return fmt.Errorf("sso: oauth2 provider %q has no authorize_url", p.Slug)
@@ -213,6 +276,15 @@ func (p *Provider) Validate() error {
 			// For KindOAuth2 there is no id_token, so UserInfo is the ONLY source of
 			// identity. Without it there is nothing to log in as.
 			return fmt.Errorf("sso: oauth2 provider %q has no userinfo_url, so it cannot establish an identity", p.Slug)
+		}
+		if p.EmailsURL != "" {
+			// It is called with the user's access token, so it must be an absolute
+			// http(s) URL — a relative or schemeless value would otherwise fail on
+			// the first login, after the user has already been redirected.
+			u, err := url.Parse(p.EmailsURL)
+			if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+				return fmt.Errorf("sso: oauth2 provider %q has an invalid emails_url %q (want an absolute http(s) URL)", p.Slug, p.EmailsURL)
+			}
 		}
 	default:
 		return fmt.Errorf("sso: provider %q has unknown kind %q (want %q or %q)", p.Slug, p.Kind, KindOIDC, KindOAuth2)

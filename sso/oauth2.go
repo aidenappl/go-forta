@@ -78,7 +78,7 @@ func (a *oauth2Adapter) Exchange(ctx context.Context, code, verifier, nonce stri
 	// every login perform a failing request first.
 	//
 	// One request, the standard library's, with the verifier attached.
-	oauthToken, err := a.oauth.Exchange(withCorrelatingClient(ctx), code, oauth2.VerifierOption(verifier))
+	oauthToken, err := a.oauth.Exchange(withCorrelatingClient(withProviderClient(ctx, a.provider)), code, oauth2.VerifierOption(verifier))
 	if err != nil {
 		return nil, nil, fmt.Errorf("sso: oauth2 code exchange: %w", err)
 	}
@@ -105,6 +105,23 @@ func (a *oauth2Adapter) Exchange(ctx context.Context, code, verifier, nonce stri
 	email := claimString(claims, a.provider.EmailClaim, "email")
 	emailVerified := a.provider.TrustEmailVerified ||
 		claimBool(claims, a.provider.EmailVerifiedClaim, "email_verified")
+
+	// Email fallback for providers (GitHub) whose profile endpoint omits a
+	// private address. Only consulted when the profile carried no email at all —
+	// a provider that does assert one is never second-guessed by a second call.
+	if email == "" && a.provider.EmailsURL != "" {
+		fbEmail, fbVerified, err := a.fallbackEmail(ctx, oauthToken.AccessToken)
+		if err != nil {
+			return nil, nil, err
+		}
+		// The per-address `verified` flag is authoritative for an address that
+		// came from the emails endpoint: TrustEmailVerified is a statement about
+		// what the provider ASSERTS in its profile, and it asserted nothing here.
+		email = fbEmail
+		emailVerified = fbVerified
+	}
+	// A verified flag with no address to attach it to must not reach a resolver.
+	emailVerified = emailVerified && email != ""
 
 	raw, err := json.Marshal(claims)
 	if err != nil {
@@ -147,7 +164,7 @@ func (a *oauth2Adapter) userInfo(ctx context.Context, accessToken string) (map[s
 	req.Header.Set("Accept", "application/json")
 	applyCorrelation(req)
 
-	resp, err := httpClient.Do(req)
+	resp, err := a.provider.client().Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("sso: oauth2 userinfo: %w", err)
 	}
@@ -164,9 +181,10 @@ func (a *oauth2Adapter) userInfo(ctx context.Context, accessToken string) (map[s
 		return nil, fmt.Errorf("sso: oauth2 userinfo status %d: %s", resp.StatusCode, truncate(string(body), 256))
 	}
 
-	// Flat object first — the standard shape.
-	var flat map[string]any
-	if err := json.Unmarshal(body, &flat); err != nil {
+	// Flat object first — the standard shape. decodeClaims keeps numbers as
+	// json.Number, so a numeric `id` stringifies exactly rather than as a float.
+	flat, err := decodeClaims(body)
+	if err != nil {
 		return nil, fmt.Errorf("sso: oauth2 userinfo is not a JSON object: %w", err)
 	}
 
@@ -179,6 +197,89 @@ func (a *oauth2Adapter) userInfo(ctx context.Context, accessToken string) (map[s
 		}
 	}
 	return flat, nil
+}
+
+// emailEntry is one element of a GitHub-shaped `/user/emails` response.
+type emailEntry struct {
+	Email    string `json:"email"`
+	Primary  bool   `json:"primary"`
+	Verified bool   `json:"verified"`
+}
+
+// fallbackEmail fetches Provider.EmailsURL and picks an address from a
+// GitHub-shaped list: `[{email, primary, verified, visibility}]`.
+//
+// Selection order: primary AND verified, then the first verified, then — with
+// verified=false — the primary (or first) unverified address. An unverified
+// address is still returned because Email is a hint; EmailVerified is what gates
+// auto-linking, and it stays false. The returned verified flag is the
+// provider's per-address one; TrustEmailVerified does not apply.
+//
+// A failure here FAILS THE LOGIN rather than continuing without an email: a
+// non-200, a malformed body, or a list with no usable address. The usual cause
+// is a missing scope (`user:email` on GitHub), and a login that silently
+// provisions an email-less user is the harder failure to diagnose.
+func (a *oauth2Adapter) fallbackEmail(ctx context.Context, accessToken string) (string, bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, userInfoTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.provider.EmailsURL, nil)
+	if err != nil {
+		return "", false, fmt.Errorf("sso: oauth2 emails request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Accept", "application/json")
+	applyCorrelation(req)
+
+	resp, err := a.provider.client().Do(req)
+	if err != nil {
+		return "", false, fmt.Errorf("sso: oauth2 emails: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := readLimited(resp.Body, maxResponseBytes)
+	if err != nil {
+		return "", false, fmt.Errorf("sso: oauth2 emails read: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", false, fmt.Errorf("sso: oauth2 emails status %d: %s", resp.StatusCode, truncate(string(body), 256))
+	}
+
+	var entries []emailEntry
+	if err := json.Unmarshal(body, &entries); err != nil {
+		return "", false, fmt.Errorf("sso: oauth2 emails is not a JSON array: %w", err)
+	}
+
+	email, verified := pickEmail(entries)
+	if email == "" {
+		return "", false, fmt.Errorf("sso: oauth2 emails endpoint returned no usable address")
+	}
+	return email, verified, nil
+}
+
+// pickEmail applies fallbackEmail's selection order.
+func pickEmail(entries []emailEntry) (string, bool) {
+	for _, e := range entries {
+		if e.Primary && e.Verified && e.Email != "" {
+			return e.Email, true
+		}
+	}
+	for _, e := range entries {
+		if e.Verified && e.Email != "" {
+			return e.Email, true
+		}
+	}
+	for _, e := range entries {
+		if e.Primary && e.Email != "" {
+			return e.Email, false
+		}
+	}
+	for _, e := range entries {
+		if e.Email != "" {
+			return e.Email, false
+		}
+	}
+	return "", false
 }
 
 // truncate bounds a string for logging.
