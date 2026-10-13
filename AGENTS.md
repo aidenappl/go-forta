@@ -771,6 +771,15 @@ the question is whether it would go red.
 
 ## Operations
 
+- **CI runners:** every GitHub Actions job runs on `[self-hosted, lattice-worker]` — a
+  single-use runner started by `aidenappl/gh-runner-broker` on the CI host (`aplb-actions`,
+  10.15.10.78), with the toolchain and shared Go/npm caches provisioned by
+  `TeamTrailblaze/runner-setup`. Images build through the host's `lattice-builder` BuildKit
+  (`builder: lattice-builder`), never `docker/setup-buildx-action`, which races other runners
+  on the shared Docker daemon; its local layer cache replaces the gha cache. `setup-go` runs
+  with `cache: false`. Jobs stuck in "Queued" mean the broker or the host is down — check the
+  `gh-runner-broker` service in Monitor (zone `appleby`).
+
 - **Not deployed.** Released by tag:
   ```bash
   git tag -a v1.x.y -m "..." && git push origin v1.x.y
