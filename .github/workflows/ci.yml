@@ -77,11 +77,11 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: false
 
+      # Pinned: govulncheck@latest (v1.9.0+) needs Go 1.26 and failed to install
+      # under 1.25, which broke every release since 2026-09. Same pin as
+      # TeamTrailblaze/runner-setup's versions.env.
       - name: Run govulncheck
-        uses: golang/govulncheck-action@v1
-        with:
-          go-version-input: ${{ env.GO_VERSION }}
-          go-package: ./...
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
 
   release:
     name: Release
