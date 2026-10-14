@@ -77,12 +77,6 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: false
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          cache: false
-
       # Pinned: govulncheck@latest (v1.9.0+) needs Go 1.26 and failed to install
       # under 1.25, which broke every release since 2026-09. Same pin as
       # TeamTrailblaze/runner-setup's versions.env.
