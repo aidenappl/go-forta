@@ -49,7 +49,7 @@ Three audiences:
 
 ## Stack & dependencies
 
-- **Go 1.25+**
+- **Go 1.26+**
 - Root `forta` package: standard library plus `github.com/golang-jwt/jwt/v5`. Two signature
   algorithms are accepted: **RS256** (issuer public key from the published JWKS — what
   `forta-api` signs with) and **HS512** (shared secret, pre-cut-over tokens only).

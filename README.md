@@ -26,7 +26,7 @@ them. A service may import both; most import one.
 go get github.com/aidenappl/go-forta
 ```
 
-**Requires Go 1.22+**
+**Requires Go 1.26+**
 
 ---
 
