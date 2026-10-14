@@ -1,6 +1,6 @@
 module github.com/aidenappl/go-forta
 
-go 1.25.5
+go 1.26.9
 
 require (
 	github.com/coreos/go-oidc/v3 v3.20.0
