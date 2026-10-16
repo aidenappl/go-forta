@@ -23,7 +23,7 @@ import (
 // User-Agent of every outbound request ("go-forta/<Version>") so forta-api can
 // tell which SDK version a consumer runs. Bump it in the same commit as the
 // release notes for a new tag.
-const Version = "1.12.0"
+const Version = "1.13.0"
 
 // UserAgent is the User-Agent set on outbound requests that do not already
 // carry one.

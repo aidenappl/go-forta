@@ -108,6 +108,7 @@ itself tells you.
 | `types.go` | Shared wire types + the `fortaEnvelope[T]` generic response wrapper. |
 | `errors.go` | Error helpers, `writeJSONError`, `writeGrantDenied`. |
 | `observe.go` | v1.11.0 observability: `Version`, `WithCorrelation`, `AuthFailure` + `Reason*` constants, `UpstreamError`, and the private `c.do` (every outbound call), `c.logf`, `c.fail`/`c.failGrant` (report to `OnAuthFailure`, then write the error). |
+| `activity/` | v1.13.0 `activity.Reporter` — fire-and-forget mirror of a platform's audited actions onto the user's Forta activity trail (`POST /internal/activity`, Basic client auth). Stdlib-only, bounded queue, one worker. See *Activity reporting*. |
 | `internal/correlate/` | Stdlib-only correlation core shared by both packages: the ctx key, `With`/`From`, `Apply` (header stamping), `FromInbound` (response/request header fallback), the correlating `Transport`, and the `Version` constant the User-Agent is built from. |
 | `middleware_refresh_test.go`, `observability_test.go` | Protected-path tests: the no-credential refresh, outbound correlation on every call, and `OnAuthFailure` reasons with a byte-for-byte response comparison against a hook-less client. |
 | `docs/implementation.md` | Full integration guide for consumers. |
@@ -477,6 +478,10 @@ Tagged releases consumed via the Go module proxy, which caches immutably.
 proxy entries cannot be rewritten, that feature shipped as **v1.3.0**. Never retag a published
 version — cut a new one.
 
+**Release notes — v1.13.0 (activity reporting).** Minor bump, purely additive: new package
+`activity` (`New`, `Config`, `Reporter.Report/Stats/Close`, outcome constants). Nothing in the root
+or `sso` packages changed except `User-Agent` → `go-forta/1.13.0`. No new module dependency.
+
 **Release notes — v1.12.0 (sso: exact numeric claims + GitHub email fallback).** Minor bump. New
 exported surface: `sso.Provider.EmailsURL` (`KindOAuth2` only; `Validate` rejects it on
 `KindOIDC` and requires an absolute http(s) URL), `ssotest.FakeIDP.ExtraClaims` and
@@ -759,6 +764,28 @@ corresponding test confirmed to fail:
 **Re-run that check when you change a defence.** A green suite is necessary and not sufficient;
 the question is whether it would go red.
 
+## Activity reporting (`activity/`)
+
+forta-api keeps a per-user `activity_events` trail (365-day retention) that the Forta dashboard
+shows as "everything this person did". Forta writes its own rows (sign-ins, grants, admin changes);
+a platform adds its own through `POST /internal/activity`, authenticated with **its own OAuth
+client id + secret** (HTTP Basic — the same pair its SSO uses). Forta stores the action as
+`platform.<action>` against the subject and the calling platform, and answers **403 when the
+subject has no active grant on that platform** — a platform can only write onto the trail of
+people it serves.
+
+| Rule | Why |
+|------|-----|
+| `Report` never blocks, never errors | It is a mirror; the platform's own audit table is the record. A Forta outage must not slow a deploy. |
+| Bounded queue (default 1000), drops counted in `Stats()` | Back-pressure would turn into request latency. |
+| One retry on network error/5xx; 4xx is final and goes to `OnError` | 4xx is Forta refusing (unknown subject, no grant) — retrying cannot fix it. |
+| `nil` `*Reporter` is valid | `New` returns nil without credentials, so callers report unconditionally. |
+| Action normalised to `[a-z0-9._-]`, ≤48 chars; ≤10 details, keys ≤32, values ≤200 | Forta's limits; trimming beats having the whole event refused. |
+| Details carry identifiers only | Never a secret, token, password, email or URL query — the trail is shown to the user and admins. |
+
+Consumers: keyring-api (every audited change + reveals), lattice-api (every `logAudit` action
+except `sso_login`, which Forta already records). Call `Close(ctx)` on shutdown to drain.
+
 ## Ecosystem & related repos
 
 | Repo | Relationship |
@@ -766,7 +793,7 @@ the question is whether it would go red.
 | [`forta-api`](https://github.com/aidenappl/forta-api) | The server. **Imports this module** for shared types — changes to `types.go` affect both sides. Its [`docs/onboarding-a-consumer.md`](https://github.com/aidenappl/forta-api/blob/main/docs/onboarding-a-consumer.md) is the outward-facing contract this SDK implements: mandatory PKCE, `aud` checking, RS256 only, opaque `frtr_` refresh handles, and the four mechanisms that end a session. **When a requirement there changes, this SDK and that document move together** — a client that satisfies one and not the other is broken in production and green in CI. |
 | [`forta-js`](https://github.com/aidenappl/forta-js) | The Node/React equivalent; keep behaviour conceptually aligned. |
 | `keyring-api` | Consumer. Delegates **all** `/admin` auth to `forta.Protected`; gained API-token support purely by bumping to v1.3.0. |
-| `lattice-api`, `monitor-core` | Consumers via their own SSO wiring. |
+| `lattice-api`, `monitor-core` | Consumers via their own SSO wiring. lattice-api also uses `activity` (as does keyring-api). |
 | `openbucket-api` | **Not** a consumer of `Protected` — it has its own user table and JWT key, and treats Forta as a generic OIDC provider. |
 
 ## Operations
