@@ -479,7 +479,7 @@ proxy entries cannot be rewritten, that feature shipped as **v1.3.0**. Never ret
 version — cut a new one.
 
 **Release notes — v1.13.0 (activity reporting).** Minor bump, purely additive: new package
-`activity` (`New`, `Config`, `Reporter.Report/Stats/Close`, outcome constants). Nothing in the root
+`activity` (`New`, `Config` incl. `Endpoint`, `Reporter.Report/Stats/Close`, outcome constants). Nothing in the root
 or `sso` packages changed except `User-Agent` → `go-forta/1.13.0`. No new module dependency.
 
 **Release notes — v1.12.0 (sso: exact numeric claims + GitHub email fallback).** Minor bump. New
@@ -783,8 +783,11 @@ people it serves.
 | Action normalised to `[a-z0-9._-]`, ≤48 chars; ≤10 details, keys ≤32, values ≤200 | Forta's limits; trimming beats having the whole event refused. |
 | Details carry identifiers only | Never a secret, token, password, email or URL query — the trail is shown to the user and admins. |
 
-Consumers: keyring-api (every audited change + reveals), lattice-api (every `logAudit` action
-except `sso_login`, which Forta already records). Call `Close(ctx)` on shutdown to drain.
+`Config.Endpoint` (full URL) overrides `APIURL`. keyring-api and lattice-api are deliberately
+provider-neutral, so they use it: both stay **off** unless `ACTIVITY_REPORT_URL` is set (prod:
+`https://auth.appleby.cloud/internal/activity`) and call it an "activity sink", never Forta.
+keyring-api sends every audited change + reveals; lattice-api every `logAudit` action except
+`sso_login`, which Forta already records. Call `Close(ctx)` on shutdown to drain.
 
 ## Ecosystem & related repos
 

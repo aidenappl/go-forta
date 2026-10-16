@@ -51,8 +51,12 @@ var actionRE = regexp.MustCompile(`[^a-z0-9._-]+`)
 // Config identifies the platform to Forta. ClientID and ClientSecret are the
 // platform's own OAuth client credentials — the same ones its SSO uses.
 type Config struct {
-	// APIURL is Forta's API base, e.g. https://auth.appleby.cloud.
-	APIURL       string
+	// APIURL is Forta's API base, e.g. https://auth.appleby.cloud; events go to
+	// APIURL + "/internal/activity".
+	APIURL string
+	// Endpoint, when set, is the full URL events are posted to and APIURL is
+	// ignored. For consumers configured with a generic "activity sink" URL.
+	Endpoint     string
 	ClientID     string
 	ClientSecret string
 	// QueueSize bounds the in-memory queue (default 1000).
@@ -86,10 +90,14 @@ type Reporter struct {
 	sent, dropped, failed atomic.Int64
 }
 
-// New starts a Reporter. With an empty APIURL, ClientID or ClientSecret it
-// returns a nil *Reporter, which accepts and discards events.
+// New starts a Reporter. Without an endpoint (Endpoint or APIURL), ClientID or
+// ClientSecret it returns a nil *Reporter, which accepts and discards events.
 func New(cfg Config) *Reporter {
-	if cfg.APIURL == "" || cfg.ClientID == "" || cfg.ClientSecret == "" {
+	endpoint := cfg.Endpoint
+	if endpoint == "" && cfg.APIURL != "" {
+		endpoint = strings.TrimRight(cfg.APIURL, "/") + "/internal/activity"
+	}
+	if endpoint == "" || cfg.ClientID == "" || cfg.ClientSecret == "" {
 		return nil
 	}
 	if cfg.QueueSize <= 0 {
@@ -101,7 +109,7 @@ func New(cfg Config) *Reporter {
 	}
 	r := &Reporter{
 		cfg:      cfg,
-		endpoint: strings.TrimRight(cfg.APIURL, "/") + "/internal/activity",
+		endpoint: endpoint,
 		client:   client,
 		queue:    make(chan event, cfg.QueueSize),
 		done:     make(chan struct{}),

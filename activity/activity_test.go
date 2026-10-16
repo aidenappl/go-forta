@@ -60,6 +60,21 @@ func TestDeliversWithBasicAuthAndNormalises(t *testing.T) {
 	}
 }
 
+func TestEndpointOverridesAPIURL(t *testing.T) {
+	var path string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		path = req.URL.Path
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer srv.Close()
+	r := New(Config{APIURL: "http://unused.invalid", Endpoint: srv.URL + "/sink", ClientID: "a", ClientSecret: "b"})
+	r.Report("u", "x", Success, nil)
+	r.Close(context.Background())
+	if path != "/sink" {
+		t.Fatalf("path = %q", path)
+	}
+}
+
 func TestRefusalIsNotRetriedAndReported(t *testing.T) {
 	calls := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
