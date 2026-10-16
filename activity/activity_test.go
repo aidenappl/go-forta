@@ -12,7 +12,7 @@ import (
 )
 
 func TestNilReporterIsSafe(t *testing.T) {
-	var r *Reporter = New(Config{}) // unconfigured → nil
+	r := New(Config{}) // unconfigured → nil *Reporter
 	r.Report("sub", "x", Success, nil)
 	r.Close(context.Background())
 	if s, d, f := r.Stats(); s+d+f != 0 {
