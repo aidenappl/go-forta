@@ -186,6 +186,28 @@ authentication is the signature, and the rule most implementations miss is that 
 `nonce`** — a logout token carrying one can be replayed into the id_token position and accepted as
 a fresh authentication. `sso/backchannel_test.go` asserts refusal of that and five other attacks.
 
+## Activity reporting (`forta/activity`)
+
+Mirror what users do in your platform onto their Forta activity trail. Fire-and-forget: `Report`
+never blocks or fails, and a reporter built without credentials is a no-op.
+
+```go
+import "github.com/aidenappl/go-forta/activity"
+
+reporter := activity.New(activity.Config{
+    APIURL:       "https://auth.appleby.cloud",
+    ClientID:     env.SSOClientID,     // your platform's own OAuth client
+    ClientSecret: env.SSOClientSecret,
+})
+defer reporter.Close(shutdownCtx)
+
+// sub is the Forta subject you received at sign-in. Details: identifiers only.
+reporter.Report(sub, "stack.deploy", activity.Success, map[string]string{"id": "22"})
+```
+
+Forta records it as `platform.stack.deploy` and refuses (403) subjects with no grant on your
+platform. See [AGENTS.md](AGENTS.md#activity-reporting-activity) for the rules.
+
 ## Documentation
 
 | Document                                         | Description                                                                                                                                                   |
